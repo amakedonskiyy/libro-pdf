@@ -117,29 +117,51 @@ _SYS_PROMPT = (
     "4. НЕ перекладай: бренди, абревіатури, формули, бібліопосилання "
     "типу (Spoerl, 1975), email, URL.\n"
     "5. Жодних коментарів, пояснень, лапок-обгорток — лише сам переклад.\n"
-    "6. Якщо сегмент — число, символ або вже {dst} мовою — поверни без змін."
+    "6. Якщо сегмент — число, символ або вже {dst} мовою — поверни без змін.\n"
+    "7. Особливо пильнуй слова, що звучать майже однаково в обох мовах "
+    "(міжмовні пастки): завжди обирай питомо {dst} відповідник, а не схожу "
+    "кальку. Напр. рос. 'уделяется'→'приділяється', 'утешение'→'розрада', "
+    "'горничная'→'покоївка', 'благоразумный'→'розважливий'."
 )
 
 _LANG = {"ru": "російської", "en": "англійської", "uk": "українську", "ua": "українську"}
 
 
-def _groq_call(api_key, model, system, user, timeout=120):
-    r = requests.post(
-        _GROQ_URL,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={
-            "model": model,
-            "temperature": 0.2,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        },
-        timeout=timeout,
-    )
-    r.raise_for_status()
-    return r.json()["content"][0]["text"] if "content" in r.json() \
-        else r.json()["choices"][0]["message"]["content"]
+def _groq_call(api_key, model, system, user, timeout=120, max_retries=8):
+    """Виклик Groq з терпеливим повтором при лімітах (429) і збоях сервера (5xx).
+    Поважає заголовок Retry-After, інакше — експоненційна затримка."""
+    delay = 3.0
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(
+                _GROQ_URL,
+                headers={"Authorization": f"Bearer {api_key}",
+                         "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "temperature": 0.2,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                },
+                timeout=timeout,
+            )
+            if r.status_code == 429 or r.status_code >= 500:
+                ra = r.headers.get("retry-after")
+                wait = float(ra) if ra else delay
+                print(f"Groq {r.status_code}, чекаю {wait:.0f}с (спроба {attempt+1})")
+                time.sleep(min(wait, 90))
+                delay = min(delay * 2, 90)
+                continue
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+        except requests.RequestException as e:
+            last_err = e
+            time.sleep(delay)
+            delay = min(delay * 2, 90)
+    raise RuntimeError(f"Groq не відповів після {max_retries} спроб: {last_err}")
 
 
 def translate_blocks(texts, api_key, model="llama-3.3-70b-versatile",
