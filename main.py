@@ -120,7 +120,7 @@ async def preview(
 ):
     """Повертає блоки з оригіналом і перекладом (JSON). Для екрана редагування."""
     pdf_bytes = await file.read()
-    pages = P.extract_blocks(pdf_bytes)
+    pages = P.extract_blocks(pdf_bytes, ocr_lang=P._LANG_OCR.get(src, "rus"))
     flat = [(b["id"], b["text"]) for blocks in pages for b in blocks]
     translated = P.translate_blocks([t for _, t in flat], api_key,
                                     model=model, src=src, dst=dst)
@@ -142,7 +142,7 @@ def _run_job(pdf_bytes, translation_id, api_key, model, src, dst, filename):
             supa_update(translation_id,
                         progress=max(1, min(95, int(done / max(total, 1) * 95))))
 
-        pages = P.extract_blocks(pdf_bytes)
+        pages = P.extract_blocks(pdf_bytes, ocr_lang=P._LANG_OCR.get(src, "rus"))
         flat = [(b["id"], b["text"]) for blocks in pages for b in blocks]
         translated = P.translate_blocks([t for _, t in flat], api_key,
                                         model=model, src=src, dst=dst, progress_cb=cb)

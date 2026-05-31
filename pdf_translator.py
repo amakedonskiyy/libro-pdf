@@ -50,11 +50,51 @@ def _pick_font(flags: int, size: float):
     return fontname, path
 
 
+# ------- OCR-рятувalка для PDF з пошкодженим текстовим шаром -------
+# Деякі книжки мають "битий" шрифт у заголовках/змісті/курсиві: текст
+# витягується як абракадабра ("Гла)а 1. ,)еде-ие" замість "Глава 1. Введение").
+# Такі блоки ми розпізнаємо OCR-ом (рендеримо як фото і читаємо очима).
+_LANG_OCR = {"ru": "rus", "uk": "ukr", "ua": "ukr", "en": "eng"}
+
+
+def _looks_garbled(text: str) -> bool:
+    """Ознака битого тексту: цифра/дужка/кома, вклеєна ВСЕРЕДИНУ слова,
+    або слово, що починається з цифри (напр. '1ГЛОР(23' = «ГЛОРИЯ»)."""
+    if not text:
+        return False
+    letters = sum(ch.isalpha() for ch in text)
+    if letters < 2:
+        return False
+    anomalies = len(re.findall(
+        r"[А-Яа-яЇїІіЄєҐґA-Za-z][\)\(\,\d][А-Яа-яЇїІіЄєҐґA-Za-z]", text))
+    anomalies += len(re.findall(r"\d[А-Яа-яЇїІіЄєҐґ]{2,}", text))  # '1ГЛОР'
+    return anomalies >= 2 or (anomalies >= 1 and len(text) <= 80)
+
+
+def _ocr_region(page, bbox, lang="rus"):
+    """Рендерить ділянку сторінки у ~300dpi і читає її Tesseract-ом."""
+    try:
+        import io
+        import pytesseract
+        from PIL import Image
+        pix = page.get_pixmap(clip=fitz.Rect(bbox), matrix=fitz.Matrix(4, 4))
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        raw = pytesseract.image_to_string(img, lang=lang)
+        # чистимо: крапки-заповнювачі змісту й зайві пробіли
+        raw = re.sub(r"\.{2,}.*$", "", raw, flags=re.M)   # геть "....... 25"
+        raw = re.sub(r"\s+", " ", raw).strip(" .")
+        return raw
+    except Exception as e:
+        print("OCR недоступний/помилка:", e)
+        return ""
+
+
 # ---------------------------------------------------------------- 1. extract
-def extract_blocks(pdf_bytes: bytes):
+def extract_blocks(pdf_bytes: bytes, ocr_lang: str = "rus"):
     """
     Повертає список сторінок. Кожна сторінка = list блоків:
       {id, page, bbox, text, size, color, fontname, fontfile}
+    Якщо блок витягнувся "битим" (пошкоджений шрифт) — рятуємо його OCR-ом.
     Працюємо на рівні БЛОКУ (≈ абзац): краще для якості перекладу
     (цілі речення) і для розкладки (insert_textbox сам переносить рядки).
     """
@@ -81,6 +121,11 @@ def extract_blocks(pdf_bytes: bytes):
             text = text.replace("\n", " ").strip()
             if not text:
                 continue
+            # якщо текст битий — рятуємо OCR-ом по цій же ділянці
+            if _looks_garbled(text):
+                fixed = _ocr_region(page, b["bbox"], ocr_lang)
+                if fixed and not _looks_garbled(fixed):
+                    text = fixed
             # домінуючий стиль = найбільший span
             main = max(spans, key=lambda s: s["size"])
             col = main.get("color", 0)
@@ -289,7 +334,7 @@ def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
 def translate_pdf(pdf_bytes, api_key, model="llama-3.3-70b-versatile",
                   src="ru", dst="uk", progress_cb=None):
     """Повний цикл: extract → translate → build. Повертає bytes готового PDF."""
-    pages = extract_blocks(pdf_bytes)
+    pages = extract_blocks(pdf_bytes, ocr_lang=_LANG_OCR.get(src, "rus"))
     flat = [(b["id"], b["text"]) for blocks in pages for b in blocks]
     ids = [i for i, _ in flat]
     texts = [t for _, t in flat]

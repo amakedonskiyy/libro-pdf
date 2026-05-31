@@ -1,8 +1,9 @@
 FROM python:3.11-slim
 
-# DejaVu шрифти (повна кирилиця) — обов'язково для рендеру українського тексту
+# DejaVu шрифти (кирилиця для рендеру) + Tesseract OCR (рятує биті заголовки)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-dejavu-core fonts-dejavu-extra \
+    tesseract-ocr tesseract-ocr-rus tesseract-ocr-ukr \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
