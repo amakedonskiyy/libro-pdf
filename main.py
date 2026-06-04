@@ -105,6 +105,12 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
             JOBS[job_id]["progress"] = max(1, min(99, int(done / max(total, 1) * 99)))
 
         pages = P.extract_blocks(pdf_bytes, ocr_lang=P._LANG_OCR.get(src, "rus"))
+        if P.looks_scanned(pages):
+            JOBS[job_id].update(status="error", error=(
+                "Схоже, це скан-книга (сторінки — зображення без тексту шару). "
+                "Поточний рушій перекладає книги з текстовим шаром. "
+                "Для сканів потрібен окремий OCR-режим (у планах)."))
+            return
         flat = [(b["id"], b["text"]) for blk in pages for b in blk]
         tr = P.translate_blocks([t for _, t in flat], api_key, provider=provider,
                                 model=model or None, src=src, dst=dst,
@@ -184,6 +190,10 @@ def _run_job(pdf_bytes, translation_id, api_key, provider, model, src, dst,
                         progress=max(1, min(95, int(done / max(total, 1) * 95))))
 
         pages = P.extract_blocks(pdf_bytes, ocr_lang=P._LANG_OCR.get(src, "rus"))
+        if P.looks_scanned(pages):
+            supa_update(translation_id, status="error", error=(
+                "Схоже, це скан-книга без текстового шару. Потрібен OCR-режим (у планах)."))
+            return
         flat = [(b["id"], b["text"]) for blocks in pages for b in blocks]
         tr = P.translate_blocks([t for _, t in flat], api_key, provider=provider,
                                 model=model or None, src=src, dst=dst,

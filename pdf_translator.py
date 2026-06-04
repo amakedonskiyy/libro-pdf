@@ -94,6 +94,16 @@ def _ocr_region(page, bbox, lang="rus"):
         return ""
 
 
+def looks_scanned(pages) -> bool:
+    """True, якщо книга схожа на СКАН: сторінки-зображення майже без тексту.
+    Такі книги поточний рушій не перекладе (немає текстового шару)."""
+    if not pages:
+        return False
+    n = len(pages)
+    total_chars = sum(len(b["text"]) for pg in pages for b in pg)
+    return n >= 3 and total_chars < 25 * n
+
+
 # ---------------------------------------------------------------- 1. extract
 def extract_blocks(pdf_bytes: bytes, ocr_lang: str = "rus"):
     """
