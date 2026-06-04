@@ -3,13 +3,15 @@ main.py — мікросервіс Libro PDF Builder (FastAPI).
 
 Ендпоінти:
   GET  /health              — перевірка.
-  POST /translate-pdf-sync  — миттєва відповідь PDF. ТІЛЬКИ для дрібних файлів (~5 стор.).
+  POST /translate-pdf-sync  — миттєва відповідь PDF. ТІЛЬКИ дрібні файли (~5 стор.).
   POST /jobs                — фонова задача БЕЗ Supabase: завантажуєш PDF, отримуєш
-                              job_id. Програма працює у фоні, не блокуючись.
-  GET  /jobs/{id}           — статус задачі (queued/processing/done/error + progress).
+                              job_id. provider=gemini|groq, proofread=true|false.
+  GET  /jobs/{id}           — статус (queued/processing/done/error + progress).
   GET  /jobs/{id}/download  — завантажити готовий PDF, коли status=done.
-  POST /preview             — блоки+переклад у JSON (для майбутнього редагування).
+  POST /preview             — блоки+переклад у JSON.
   POST /translate-pdf       — фон із записом у Supabase (для інтеграції з Lovable).
+
+api_key = ключ обраного провайдера (Gemini: AIza...  /  Groq: gsk_...).
 """
 import os
 import io
@@ -29,7 +31,6 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 SUPA_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPA_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
-# ---- сховище фонових задач у пам'яті + файли на диску ----
 JOBS = {}
 JOB_DIR = "/tmp/libro_jobs"
 os.makedirs(JOB_DIR, exist_ok=True)
@@ -78,13 +79,15 @@ def health():
 
 @app.post("/translate-pdf-sync")
 def translate_sync(file: UploadFile = File(...), api_key: str = Form(...),
-                   model: str = Form("llama-3.3-70b-versatile"),
-                   src: str = Form("ru"), dst: str = Form("uk")):
-    """Синхронно: PDF -> готовий PDF. ТІЛЬКИ для дрібних файлів (~5 стор.).
-    def (не async) -> Starlette виконує в threadpool і не блокує сервер."""
+                   provider: str = Form("gemini"), model: str = Form(""),
+                   src: str = Form("ru"), dst: str = Form("uk"),
+                   proofread: bool = Form(False)):
+    """Синхронно: PDF -> готовий PDF. ТІЛЬКИ дрібні файли (~5 стор.)."""
     pdf_bytes = file.file.read()
     try:
-        out = P.translate_pdf(pdf_bytes, api_key, model=model, src=src, dst=dst)
+        out = P.translate_pdf(pdf_bytes, api_key, provider=provider,
+                              model=model or None, src=src, dst=dst,
+                              proofread=proofread)
     except Exception as e:
         raise HTTPException(500, f"translate error: {e}")
     name = (file.filename or "book").rsplit(".", 1)[0] + "_uk.pdf"
@@ -93,7 +96,8 @@ def translate_sync(file: UploadFile = File(...), api_key: str = Form(...),
 
 
 # ----------- ФОНОВА ЧЕРГА без Supabase (для великих книг через браузер) -----------
-def _run_local_job(job_id, pdf_bytes, api_key, model, src, dst, filename):
+def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
+                   proofread, filename):
     try:
         JOBS[job_id].update(status="processing", progress=1)
 
@@ -102,8 +106,9 @@ def _run_local_job(job_id, pdf_bytes, api_key, model, src, dst, filename):
 
         pages = P.extract_blocks(pdf_bytes, ocr_lang=P._LANG_OCR.get(src, "rus"))
         flat = [(b["id"], b["text"]) for blk in pages for b in blk]
-        tr = P.translate_blocks([t for _, t in flat], api_key,
-                                model=model, src=src, dst=dst, progress_cb=cb)
+        tr = P.translate_blocks([t for _, t in flat], api_key, provider=provider,
+                                model=model or None, src=src, dst=dst,
+                                proofread=proofread, progress_cb=cb)
         tmap = {flat[i][0]: tr[i] for i in range(len(flat))}
         out = P.build_pdf(pdf_bytes, pages, tmap)
         path = os.path.join(JOB_DIR, f"{job_id}.pdf")
@@ -118,15 +123,16 @@ def _run_local_job(job_id, pdf_bytes, api_key, model, src, dst, filename):
 @app.post("/jobs")
 async def create_job(background: BackgroundTasks,
                      file: UploadFile = File(...), api_key: str = Form(...),
-                     model: str = Form("llama-3.3-70b-versatile"),
-                     src: str = Form("ru"), dst: str = Form("uk")):
+                     provider: str = Form("gemini"), model: str = Form(""),
+                     src: str = Form("ru"), dst: str = Form("uk"),
+                     proofread: bool = Form(False)):
     """Запускає фонову задачу. Одразу повертає job_id (без таймауту)."""
     pdf_bytes = await file.read()
     job_id = uuid.uuid4().hex[:12]
     base = (file.filename or "book").rsplit(".", 1)[0]
     JOBS[job_id] = {"status": "queued", "progress": 0, "name": f"{base}_uk.pdf"}
-    background.add_task(_run_local_job, job_id, pdf_bytes, api_key,
-                        model, src, dst, file.filename)
+    background.add_task(_run_local_job, job_id, pdf_bytes, api_key, provider,
+                        model, src, dst, proofread, file.filename)
     return JSONResponse({
         "job_id": job_id,
         "status_url": f"/jobs/{job_id}",
@@ -152,12 +158,14 @@ def job_download(job_id: str):
 
 @app.post("/preview")
 def preview(file: UploadFile = File(...), api_key: str = Form(...),
-            model: str = Form("llama-3.3-70b-versatile"),
-            src: str = Form("ru"), dst: str = Form("uk")):
+            provider: str = Form("gemini"), model: str = Form(""),
+            src: str = Form("ru"), dst: str = Form("uk"),
+            proofread: bool = Form(False)):
     pdf_bytes = file.file.read()
     pages = P.extract_blocks(pdf_bytes, ocr_lang=P._LANG_OCR.get(src, "rus"))
     flat = [(b["id"], b["text"]) for blocks in pages for b in blocks]
-    tr = P.translate_blocks([t for _, t in flat], api_key, model=model, src=src, dst=dst)
+    tr = P.translate_blocks([t for _, t in flat], api_key, provider=provider,
+                            model=model or None, src=src, dst=dst, proofread=proofread)
     tmap = {flat[i][0]: tr[i] for i in range(len(flat))}
     return JSONResponse({"blocks": [
         {"id": b["id"], "page": b["page"], "size": b["size"],
@@ -166,7 +174,8 @@ def preview(file: UploadFile = File(...), api_key: str = Form(...),
 
 
 # ----------- ФОНОВА ЧЕРГА із Supabase (для інтеграції з Lovable) -----------
-def _run_job(pdf_bytes, translation_id, api_key, model, src, dst, filename):
+def _run_job(pdf_bytes, translation_id, api_key, provider, model, src, dst,
+             proofread, filename):
     try:
         supa_update(translation_id, status="processing", progress=1)
 
@@ -176,8 +185,9 @@ def _run_job(pdf_bytes, translation_id, api_key, model, src, dst, filename):
 
         pages = P.extract_blocks(pdf_bytes, ocr_lang=P._LANG_OCR.get(src, "rus"))
         flat = [(b["id"], b["text"]) for blocks in pages for b in blocks]
-        tr = P.translate_blocks([t for _, t in flat], api_key,
-                                model=model, src=src, dst=dst, progress_cb=cb)
+        tr = P.translate_blocks([t for _, t in flat], api_key, provider=provider,
+                                model=model or None, src=src, dst=dst,
+                                proofread=proofread, progress_cb=cb)
         tmap = {flat[i][0]: tr[i] for i in range(len(flat))}
         out = P.build_pdf(pdf_bytes, pages, tmap)
         supa_update(translation_id, progress=97)
@@ -193,12 +203,13 @@ def _run_job(pdf_bytes, translation_id, api_key, model, src, dst, filename):
 async def translate_async(background: BackgroundTasks,
                           file: UploadFile = File(...), translation_id: str = Form(...),
                           api_key: str = Form(...),
-                          model: str = Form("llama-3.3-70b-versatile"),
-                          src: str = Form("ru"), dst: str = Form("uk")):
+                          provider: str = Form("gemini"), model: str = Form(""),
+                          src: str = Form("ru"), dst: str = Form("uk"),
+                          proofread: bool = Form(False)):
     if not (SUPA_URL and SUPA_KEY):
         raise HTTPException(500, "Supabase не налаштований. Для тесту: /jobs")
     pdf_bytes = await file.read()
-    background.add_task(_run_job, pdf_bytes, translation_id, api_key,
-                        model, src, dst, file.filename)
+    background.add_task(_run_job, pdf_bytes, translation_id, api_key, provider,
+                        model, src, dst, proofread, file.filename)
     return JSONResponse({"status": "started", "translation_id": translation_id},
                         status_code=202)

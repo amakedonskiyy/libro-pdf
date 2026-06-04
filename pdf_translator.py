@@ -68,6 +68,11 @@ def _looks_garbled(text: str) -> bool:
     anomalies = len(re.findall(
         r"[А-Яа-яЇїІіЄєҐґA-Za-z][\)\(\,\d][А-Яа-яЇїІіЄєҐґA-Za-z]", text))
     anomalies += len(re.findall(r"\d[А-Яа-яЇїІіЄєҐґ]{2,}", text))  # '1ГЛОР'
+    # короткий заголовок, у якому є і дужка, і цифра поряд із КИРИЛИЦЕЮ
+    # (напр. 'ЧА)9Ь 1'); латинські посилання типу '(Spoerl, 1975)' не чіпаємо
+    if (len(text) <= 40 and re.search(r"[\)\(]", text) and re.search(r"\d", text)
+            and re.search(r"[А-Яа-яЇїІіЄєҐґ]", text)):
+        return True
     return anomalies >= 2 or (anomalies >= 1 and len(text) <= 80)
 
 
@@ -149,6 +154,7 @@ def extract_blocks(pdf_bytes: bytes, ocr_lang: str = "rus"):
 
 # ---------------------------------------------------------------- 2. translate
 _GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+_GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 _DELIM = "\n<<<§>>>\n"
 
 _SYS_PROMPT = (
@@ -166,7 +172,23 @@ _SYS_PROMPT = (
     "7. Особливо пильнуй слова, що звучать майже однаково в обох мовах "
     "(міжмовні пастки): завжди обирай питомо {dst} відповідник, а не схожу "
     "кальку. Напр. рос. 'уделяется'→'приділяється', 'утешение'→'розрада', "
-    "'горничная'→'покоївка', 'благоразумный'→'розважливий'."
+    "'горничная'→'покоївка', 'благоразумный'→'розважливий'.\n"
+    "8. ТОЧНІСТЬ ФАКТІВ понад усе. Не змінюй факти, числа, назви, посилання. "
+    "НЕ «локалізуй»: якщо в оригіналі Росія, РФ, «Федеральний закон», російське "
+    "видання чи «російськомовні» — лишай саме так, НЕ заміняй на Україну."
+)
+
+_EDITOR_PROMPT = (
+    "Ти — досвідчений літературний редактор-коректор. Тобі дають пари: "
+    "ОРИГІНАЛ ({src}) і ЧЕРНЕТКА перекладу ({dst}). Для КОЖНОЇ пари поверни "
+    "ВИПРАВЛЕНУ версію {dst} мовою.\n"
+    "Виправ: русизми й кальки (став питоме {dst} слово); граматику, відмінки, "
+    "узгодження роду й числа; зроби текст природним і живим.\n"
+    "КРИТИЧНО: зміст МАЄ точно відповідати оригіналу — нічого не вигадуй і не "
+    "пропускай. НЕ «локалізуй»: РФ/Росія/«Федеральний закон»/«російськомовні» "
+    "лишаються як в оригіналі.\n"
+    "Якщо чернетка вже бездоганна — поверни її без змін. "
+    "Жодних коментарів — лише виправлений переклад."
 )
 
 _LANG = {"ru": "російської", "en": "англійської", "uk": "українську", "ua": "українську"}
@@ -209,29 +231,93 @@ def _groq_call(api_key, model, system, user, timeout=120, max_retries=8):
     raise RuntimeError(f"Groq не відповів після {max_retries} спроб: {last_err}")
 
 
-def translate_blocks(texts, api_key, model="llama-3.3-70b-versatile",
-                     src="ru", dst="uk", char_budget=1400, progress_cb=None):
-    """
-    Перекладає список рядків. Батчить по char_budget символів,
-    перевіряє, що кількість сегментів збіглася; інакше — fallback по одному.
-    progress_cb(done, total) — необов'язковий колбек прогресу.
-    """
-    system = _SYS_PROMPT.format(src=_LANG.get(src, src), dst=_LANG.get(dst, dst))
-    out = [None] * len(texts)
-    total = len(texts)
-    done = 0
+def _gemini_call(api_key, model, system, user, timeout=120, max_retries=8):
+    """Виклик Gemini (Google AI) з повтором при лімітах/збоях."""
+    url = f"{_GEMINI_BASE}/{model}:generateContent"
+    delay = 3.0
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(
+                url, params={"key": api_key},
+                headers={"Content-Type": "application/json"},
+                json={
+                    "systemInstruction": {"parts": [{"text": system}]},
+                    "contents": [{"role": "user", "parts": [{"text": user}]}],
+                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192},
+                },
+                timeout=timeout,
+            )
+            if r.status_code == 429 or r.status_code >= 500:
+                ra = r.headers.get("retry-after")
+                wait = float(ra) if ra else delay
+                print(f"Gemini {r.status_code}, чекаю {wait:.0f}с (спроба {attempt+1})")
+                time.sleep(min(wait, 90))
+                delay = min(delay * 2, 90)
+                continue
+            r.raise_for_status()
+            cands = r.json().get("candidates", [])
+            if not cands:
+                raise RuntimeError("порожня відповідь (можливо, фільтр безпеки)")
+            parts = cands[0].get("content", {}).get("parts", [])
+            return "".join(p.get("text", "") for p in parts)
+        except requests.RequestException as e:
+            last_err = e
+            time.sleep(delay)
+            delay = min(delay * 2, 90)
+        except RuntimeError as e:
+            last_err = e
+            break
+    raise RuntimeError(f"Gemini не відповів: {last_err}")
 
-    # формуємо батчі індексів
+
+def _llm_call(provider, api_key, model, system, user):
+    if provider == "gemini":
+        return _gemini_call(api_key, model, system, user)
+    return _groq_call(api_key, model, system, user)
+
+
+def _default_model(provider):
+    return "gemini-2.5-flash" if provider == "gemini" else "llama-3.3-70b-versatile"
+
+
+def _make_batches(items_len, length_of, char_budget):
+    """Групує індекси у батчі за сумарною довжиною."""
     batches, cur, cur_len = [], [], 0
-    for i, t in enumerate(texts):
-        if cur and cur_len + len(t) > char_budget:
+    for i in range(items_len):
+        L = length_of(i)
+        if cur and cur_len + L > char_budget:
             batches.append(cur)
             cur, cur_len = [], 0
         cur.append(i)
-        cur_len += len(t) + len(_DELIM)
+        cur_len += L + len(_DELIM)
     if cur:
         batches.append(cur)
+    return batches
 
+
+def translate_blocks(texts, api_key, provider="gemini", model=None,
+                     src="ru", dst="uk", char_budget=2500, proofread=False,
+                     progress_cb=None):
+    """
+    Перекладає список рядків. Батчить, перевіряє кількість сегментів,
+    fallback по одному. Якщо proofread=True — другий прохід-редактор.
+    Прогрес рахується на обидві фази (переклад + редактор).
+    """
+    model = model or _default_model(provider)
+    system = _SYS_PROMPT.format(src=_LANG.get(src, src), dst=_LANG.get(dst, dst))
+    out = [None] * len(texts)
+    total = len(texts)
+    phases = 2 if proofread else 1
+    total_work = max(total * phases, 1)
+    work = [0]
+
+    def report(n):
+        work[0] += n
+        if progress_cb:
+            progress_cb(work[0], total_work)
+
+    batches = _make_batches(total, lambda i: len(texts[i]), char_budget)
     for batch in batches:
         segs = [texts[i] for i in batch]
         user = ("Переклади кожен сегмент окремо. Сегменти розділені рядком <<<§>>>. "
@@ -239,7 +325,7 @@ def translate_blocks(texts, api_key, model="llama-3.3-70b-versatile",
                 "Кількість сегментів МАЄ збігатися.\n\n" + _DELIM.join(segs))
         ok = False
         try:
-            resp = _groq_call(api_key, model, system, user)
+            resp = _llm_call(provider, api_key, model, system, user)
             parts = [p.strip() for p in resp.split("<<<§>>>")]
             if len(parts) == len(batch):
                 for k, idx in enumerate(batch):
@@ -248,17 +334,61 @@ def translate_blocks(texts, api_key, model="llama-3.3-70b-versatile",
         except Exception as e:
             print("batch error:", e)
         if not ok:
-            # fallback: по одному сегменту (надійне вирівнювання)
             for idx in batch:
                 try:
-                    out[idx] = _groq_call(api_key, model, system, texts[idx]).strip() or texts[idx]
+                    out[idx] = _llm_call(provider, api_key, model, system,
+                                         texts[idx]).strip() or texts[idx]
                 except Exception as e:
                     print("single error:", e)
-                    out[idx] = texts[idx]   # гірший випадок — лишаємо оригінал
-        done += len(batch)
-        if progress_cb:
-            progress_cb(done, total)
-        time.sleep(0.2)   # бережемо rate-limit
+                    out[idx] = texts[idx]
+        report(len(batch))
+        time.sleep(0.2)
+
+    if proofread:
+        out = proofread_blocks(texts, out, api_key, provider, model, src, dst,
+                               char_budget=char_budget, on_done=report)
+    return out
+
+
+def proofread_blocks(originals, drafts, api_key, provider, model, src, dst,
+                     char_budget=2500, on_done=None):
+    """Другий прохід: редактор виправляє чернетку, звіряючи з оригіналом."""
+    system = _EDITOR_PROMPT.format(src=_LANG.get(src, src), dst=_LANG.get(dst, dst))
+    out = list(drafts)
+    n = len(drafts)
+
+    def pair(i):
+        return f"ОРИГІНАЛ:\n{originals[i]}\n\nЧЕРНЕТКА:\n{drafts[i]}"
+
+    batches = _make_batches(n, lambda i: len(originals[i]) + len(drafts[i]), char_budget)
+    for batch in batches:
+        user = ("Виправ кожну пару. Пари розділені рядком <<<§>>>. Поверни лише "
+                "виправлені переклади в тому ж порядку, розділені тим самим рядком "
+                "<<<§>>>. Кількість МАЄ збігатися.\n\n"
+                + _DELIM.join(pair(i) for i in batch))
+        ok = False
+        try:
+            resp = _llm_call(provider, api_key, model, system, user)
+            parts = [p.strip() for p in resp.split("<<<§>>>")]
+            if len(parts) == len(batch):
+                for k, idx in enumerate(batch):
+                    if parts[k]:
+                        out[idx] = parts[k]
+                ok = True
+        except Exception as e:
+            print("proofread batch error:", e)
+        if not ok:
+            for idx in batch:
+                try:
+                    fixed = _llm_call(provider, api_key, model, system,
+                                      pair(idx) + "\n\nПоверни лише виправлений переклад.")
+                    if fixed.strip():
+                        out[idx] = fixed.strip()
+                except Exception as e:
+                    print("proofread single error:", e)  # лишаємо чернетку
+        if on_done:
+            on_done(len(batch))
+        time.sleep(0.2)
     return out
 
 
@@ -331,14 +461,15 @@ def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
 
 
 # ---------------------------------------------------------------- orchestrate
-def translate_pdf(pdf_bytes, api_key, model="llama-3.3-70b-versatile",
-                  src="ru", dst="uk", progress_cb=None):
-    """Повний цикл: extract → translate → build. Повертає bytes готового PDF."""
+def translate_pdf(pdf_bytes, api_key, provider="gemini", model=None,
+                  src="ru", dst="uk", proofread=False, progress_cb=None):
+    """Повний цикл: extract → translate (+редактор) → build. Повертає bytes PDF."""
     pages = extract_blocks(pdf_bytes, ocr_lang=_LANG_OCR.get(src, "rus"))
     flat = [(b["id"], b["text"]) for blocks in pages for b in blocks]
     ids = [i for i, _ in flat]
     texts = [t for _, t in flat]
-    translated = translate_blocks(texts, api_key, model=model, src=src, dst=dst,
+    translated = translate_blocks(texts, api_key, provider=provider, model=model,
+                                  src=src, dst=dst, proofread=proofread,
                                   progress_cb=progress_cb)
     tmap = {ids[k]: translated[k] for k in range(len(ids))}
     return build_pdf(pdf_bytes, pages, tmap)
