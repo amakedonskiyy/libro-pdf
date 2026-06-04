@@ -162,6 +162,23 @@ def job_download(job_id: str):
     return FileResponse(j["path"], media_type="application/pdf", filename=j["name"])
 
 
+@app.post("/cover")
+def cover(file: UploadFile = File(...), api_key: str = Form(...),
+          provider: str = Form("gemini"), model: str = Form(""),
+          src: str = Form("ru"), dst: str = Form("uk"),
+          title: str = Form(""), author: str = Form("")):
+    """Генерує нову обкладинку у стилі оригіналу з перекладеною назвою (PNG).
+    title/author можна задати вручну; якщо порожні — беруться з обкладинки (OCR)."""
+    pdf_bytes = file.file.read()
+    try:
+        png = P.make_cover(pdf_bytes, api_key, provider=provider, model=model or None,
+                           src=src, dst=dst, title=title or None, author=author or None)
+    except Exception as e:
+        raise HTTPException(500, f"cover error: {e}")
+    return StreamingResponse(io.BytesIO(png), media_type="image/png",
+                             headers={"Content-Disposition": 'attachment; filename="cover.png"'})
+
+
 @app.post("/preview")
 def preview(file: UploadFile = File(...), api_key: str = Form(...),
             provider: str = Form("gemini"), model: str = Form(""),

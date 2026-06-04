@@ -587,3 +587,109 @@ def translate_scanned_pdf(pdf_bytes, api_key, provider="gemini", model=None,
     result = out_doc.tobytes(deflate=True, garbage=4)
     src_doc.close(); out_doc.close()
     return result
+
+
+# ================================================================
+#            ГЕНЕРАЦІЯ ОБКЛАДИНКИ З ПЕРЕКЛАДЕНОЮ НАЗВОЮ
+# ================================================================
+def _lum(c):
+    return 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
+
+
+def _dominant_colors(img, k=6):
+    from PIL import Image
+    small = img.convert("RGB").resize((80, 120))
+    q = small.quantize(colors=k, method=Image.MEDIANCUT).convert("RGB")
+    cs = sorted(q.getcolors(80 * 120) or [], key=lambda c: -c[0])
+    return [c[1] for c in cs] or [(40, 60, 80)]
+
+
+def _guess_title_author(doc, ocr_lang="rus"):
+    """Витягуємо назву й автора з ОБКЛАДИНКИ (OCR) — найбільший текст = назва."""
+    lines = [l for l in _ocr_lines(doc[0], ocr_lang) if 1 < len(l["text"]) < 60]
+    if not lines:
+        return ("Без назви", "")
+    for l in lines:
+        l["h"] = l["bbox"][3] - l["bbox"][1]
+    maxh = max(l["h"] for l in lines)
+    big = sorted([l for l in lines if l["h"] >= 0.7 * maxh], key=lambda l: l["bbox"][1])
+    title = " ".join(l["text"] for l in big)
+    rest = sorted([l for l in lines if l["h"] < 0.7 * maxh], key=lambda l: -l["h"])
+    author = rest[0]["text"] if rest else ""
+    return (title[:120], author[:60])
+
+
+def make_cover(pdf_bytes, api_key, provider="gemini", model=None,
+               src="ru", dst="uk", title=None, author=None):
+    """Нова обкладинка у стилі оригіналу + перекладена назва/автор + акценти."""
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter
+    import textwrap, random
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pix = doc[0].get_pixmap(matrix=fitz.Matrix(1.2, 1.2))
+    cover = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+    pal = _dominant_colors(cover, 6)
+    if not title:
+        title, a2 = _guess_title_author(doc, _LANG_OCR.get(src, "rus"))
+        author = author or a2
+    src_lines = [title] + ([author] if author else [])
+    tr = translate_blocks(src_lines, api_key, provider=provider, model=model, src=src, dst=dst)
+    t_title = tr[0].strip()
+    t_author = (tr[1].strip() if author else "")
+    aspect = cover.height / cover.width if cover.width else 1.4
+    doc.close()
+
+    W = 1000
+    H = max(1200, min(int(W * aspect), 1500))
+    # фон-градієнт між двома виразними кольорами палітри
+    c1 = max(pal[:3], key=lambda c: abs(_lum(c) - 110))
+    c2 = pal[1] if len(pal) > 1 else c1
+    base = Image.new("RGB", (W, H), c1)
+    top = Image.new("RGB", (W, H), c2)
+    mask = Image.new("L", (W, H))
+    md = ImageDraw.Draw(mask)
+    for y in range(H):
+        md.line([(0, y), (W, y)], fill=int(255 * y / H))
+    base = Image.composite(base, top, mask).convert("RGBA")
+    # м'які painterly-форми у палітрі (окремі елементи)
+    blob = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    bd = ImageDraw.Draw(blob)
+    random.seed(len(pdf_bytes))
+    for i in range(6):
+        col = pal[i % len(pal)]
+        r = random.randint(W // 4, W // 2)
+        x = random.randint(-r // 3, W); y = random.randint(-r // 3, H)
+        bd.ellipse([x - r, y - r, x + r, y + r], fill=(col[0], col[1], col[2], 70))
+    base = Image.alpha_composite(base, blob.filter(ImageFilter.GaussianBlur(70))).convert("RGB")
+    draw = ImageDraw.Draw(base)
+
+    txt_col = (255, 255, 255) if _lum(c1) < 140 else (25, 25, 25)
+    accent = max(pal, key=lambda c: (max(c) - min(c)))
+    fb = _FONTS[("sans", True, False)]
+
+    # заголовок: підбираємо кегль і переносимо
+    title_up = t_title.upper()
+    size = 88
+    wrapped = [title_up]
+    while size > 30:
+        font = ImageFont.truetype(fb, size)
+        maxchars = max(6, int((W - 150) / max(font.getlength("М"), 1)))
+        wrapped = textwrap.wrap(title_up, width=maxchars)
+        if len(wrapped) * size * 1.15 < H * 0.5 and len(wrapped) <= 6:
+            break
+        size -= 4
+    y = H * 0.20
+    for line in wrapped:
+        w = font.getlength(line)
+        draw.text(((W - w) / 2, y), line, font=font, fill=txt_col)
+        y += size * 1.15
+    # акцент-лінія
+    ly = y + 28
+    draw.rectangle([W * 0.36, ly, W * 0.64, ly + 7], fill=accent)
+    # автор
+    if t_author:
+        af = ImageFont.truetype(fb, 42)
+        aw = af.getlength(t_author.upper())
+        draw.text(((W - aw) / 2, H * 0.83), t_author.upper(), font=af, fill=txt_col)
+
+    out = io.BytesIO(); base.save(out, "PNG")
+    return out.getvalue()
