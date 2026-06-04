@@ -436,6 +436,24 @@ def _place_text(page, bbox, text, fontname, fontfile, color, size):
     return False
 
 
+def _sample_bg(img, x0, y0, x1, y1, pad=6):
+    """Домінантний колір РАМКИ навколо боксу (фон сторінки біля тексту), rgb 0..255."""
+    W, H = img.size
+    x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+    bands = [(x0 - pad, y0 - pad, x1 + pad, y0), (x0 - pad, y1, x1 + pad, y1 + pad),
+             (x0 - pad, y0, x0, y1), (x1, y0, x1 + pad, y1)]
+    cnt = {}
+    for bx0, by0, bx1, by1 in bands:
+        bx0, by0 = max(0, bx0), max(0, by0)
+        bx1, by1 = min(W, bx1), min(H, by1)
+        if bx1 <= bx0 or by1 <= by0:
+            continue
+        crop = img.crop((bx0, by0, bx1, by1)).convert("RGB")
+        for c, col in (crop.getcolors(crop.width * crop.height) or []):
+            cnt[col] = cnt.get(col, 0) + c
+    return max(cnt.items(), key=lambda kv: kv[1])[0] if cnt else (255, 255, 255)
+
+
 def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
               keep_image_bg=True):
     """
@@ -451,16 +469,28 @@ def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
             continue
         page = doc[blocks[0]["page"]]
         page_r = page.rect
-        # 3a. РЕДАКЦІЯ: позначаємо й фізично видаляємо оригінальний текст
+        # рендеримо сторінку (раз) ЛИШЕ якщо на ній є зображення — щоб брати
+        # колір фону під блоком і не лишати білих плям на кольорі/картинці
+        pimg, zoom = None, 2.0
+        if page.get_images():
+            try:
+                from PIL import Image
+                pm = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                pimg = Image.open(io.BytesIO(pm.tobytes("png"))).convert("RGB")
+            except Exception:
+                pimg = None
+        # 3a. РЕДАКЦІЯ: фізично видаляємо оригінальний текст, заливаючи ФОНОМ
         for b in blocks:
             r = fitz.Rect(b["bbox"])
             r.x0 -= 1; r.y0 -= 1; r.x1 += 1; r.y1 += 1
             r = r & page_r                      # обов'язково в межах сторінки!
             if r.is_empty:
                 continue
-            # якщо текст лежить поверх зображення — підбираємо колір заливки під фон,
-            # щоб не лишалося білої плями (інакше fill=біле)
             fill = (1, 1, 1)
+            if pimg is not None:
+                x0, y0, x1, y1 = b["bbox"]
+                c = _sample_bg(pimg, x0 * zoom, y0 * zoom, x1 * zoom, y1 * zoom)
+                fill = (c[0] / 255, c[1] / 255, c[2] / 255)
             page.add_redact_annot(r, fill=fill)
         # зображення НЕ чіпаємо
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
@@ -524,17 +554,11 @@ def _ocr_lines(page, lang="rus", dpi=200, min_conf=35):
         g["x1"] = max(g["x1"], x + w); g["y1"] = max(g["y1"], y + h)
     lines = []
     for g in groups.values():
-        # домінантний колір ділянки = фон (парчмент/папір)
-        try:
-            crop = img.crop((g["x0"], g["y0"], g["x1"], g["y1"]))
-            cs = crop.getcolors(maxcolors=200000)
-            bg = max(cs, key=lambda c: c[0])[1] if cs else (255, 255, 255)
-        except Exception:
-            bg = (255, 255, 255)
+        bg = _sample_bg(img, g["x0"], g["y0"], g["x1"], g["y1"], pad=8)
         lines.append({
             "text": " ".join(g["w"]),
             "bbox": (g["x0"] / zoom, g["y0"] / zoom, g["x1"] / zoom, g["y1"] / zoom),
-            "bg": (bg[0] / 255, bg[1] / 255, bg[2] / 255),
+            "bg": bg,   # rgb 0..255
         })
     lines.sort(key=lambda l: (round(l["bbox"][1] / 5), l["bbox"][0]))
     return lines
@@ -570,17 +594,20 @@ def translate_scanned_pdf(pdf_bytes, api_key, provider="gemini", model=None,
         newp.show_pdf_page(rect, src_doc, pno)        # оригінальний скан як фон
         for l in page_lines[pno]:
             uk = l.get("uk", "").strip()
-            if not uk:
+            # переклад не вдався (= оригінал) → лишаємо оригінал, НЕ замазуємо
+            if not uk or uk == l["text"].strip():
                 continue
             x0, y0, x1, y1 = l["bbox"]
-            box = fitz.Rect(x0, y0, x1, y1)
-            newp.draw_rect(box, color=None, fill=l["bg"])   # замазати оригінал фоном
-            # вписуємо переклад, зменшуючи кегль, поки влізе
-            grow = fitz.Rect(x0, y0, x1 + (x1 - x0) * 0.8, y1 + (y1 - y0) * 1.2)
+            bg = l["bg"]                                   # 0..255
+            newp.draw_rect(fitz.Rect(x0, y0, x1, y1), color=None,
+                           fill=(bg[0] / 255, bg[1] / 255, bg[2] / 255))
+            # колір тексту під фон: темний фон → білий текст, світлий → темний
+            tc = (1, 1, 1) if _lum(bg) < 130 else (0.1, 0.1, 0.1)
+            grow = fitz.Rect(x0, y0, x1 + (x1 - x0) * 0.8, y1 + (y1 - y0) * 1.3)
             size = max(6.0, (y1 - y0) * 0.85)
-            for _ in range(6):
+            for _ in range(7):
                 rc = newp.insert_textbox(grow, uk, fontfile=fontfile, fontname="ocr",
-                                         fontsize=size, color=(0, 0, 0), align=0)
+                                         fontsize=size, color=tc, align=0)
                 if rc >= 0:
                     break
                 size *= 0.85
@@ -604,55 +631,98 @@ def _dominant_colors(img, k=6):
     return [c[1] for c in cs] or [(40, 60, 80)]
 
 
-def _guess_title_author(doc, ocr_lang="rus"):
-    """Витягуємо назву й автора з ОБКЛАДИНКИ (OCR) — найбільший текст = назва."""
+def _cover_lines(doc, ocr_lang="rus"):
+    """OCR обкладинки -> (рядки назви, рядки автора) з координатами (в пунктах)."""
     lines = [l for l in _ocr_lines(doc[0], ocr_lang) if 1 < len(l["text"]) < 60]
     if not lines:
-        return ("Без назви", "")
+        return [], []
     for l in lines:
         l["h"] = l["bbox"][3] - l["bbox"][1]
     maxh = max(l["h"] for l in lines)
-    big = sorted([l for l in lines if l["h"] >= 0.7 * maxh], key=lambda l: l["bbox"][1])
-    title = " ".join(l["text"] for l in big)
-    rest = sorted([l for l in lines if l["h"] < 0.7 * maxh], key=lambda l: -l["h"])
-    author = rest[0]["text"] if rest else ""
-    return (title[:120], author[:60])
+    title = sorted([l for l in lines if l["h"] >= 0.7 * maxh], key=lambda l: l["bbox"][1])
+    author = sorted([l for l in lines if l["h"] < 0.7 * maxh], key=lambda l: -l["h"])[:1]
+    return title, author
 
 
 def make_cover(pdf_bytes, api_key, provider="gemini", model=None,
                src="ru", dst="uk", title=None, author=None):
-    """Нова обкладинка у стилі оригіналу + перекладена назва/автор + акценти."""
+    """Однотонний фон -> заміна назви НА МІСЦІ (оригінал лишається).
+    Складний фон -> нова обкладинка у стилі оригіналу. Текст завжди наш (чіткий)."""
     from PIL import Image, ImageDraw, ImageFont, ImageFilter
     import textwrap, random
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pix = doc[0].get_pixmap(matrix=fitz.Matrix(1.2, 1.2))
+    M = 2.0
+    pix = doc[0].get_pixmap(matrix=fitz.Matrix(M, M))
     cover = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
     pal = _dominant_colors(cover, 6)
-    if not title:
-        title, a2 = _guess_title_author(doc, _LANG_OCR.get(src, "rus"))
-        author = author or a2
-    src_lines = [title] + ([author] if author else [])
-    tr = translate_blocks(src_lines, api_key, provider=provider, model=model, src=src, dst=dst)
-    t_title = tr[0].strip()
+    tlines, alines = _cover_lines(doc, _LANG_OCR.get(src, "rus"))
+    title = title or (" ".join(l["text"] for l in tlines) if tlines else "Без назви")
+    if author is None:
+        author = alines[0]["text"] if alines else ""
+    tr = translate_blocks([title] + ([author] if author else []), api_key,
+                          provider=provider, model=model, src=src, dst=dst)
+    t_title = (tr[0].strip() or title)
     t_author = (tr[1].strip() if author else "")
-    aspect = cover.height / cover.width if cover.width else 1.4
     doc.close()
+    fb = _FONTS[("sans", True, False)]
 
+    def fit_font(text, box_w, box_h, start):
+        size = max(14, int(start))
+        while size > 12:
+            f = ImageFont.truetype(fb, size)
+            mc = max(4, int(box_w / max(f.getlength("М"), 1)))
+            wr = textwrap.wrap(text, width=mc) or [text]
+            if len(wr) * size * 1.12 <= box_h and max(f.getlength(w) for w in wr) <= box_w:
+                return f, wr, size
+            size -= 3
+        f = ImageFont.truetype(fb, 13)
+        return f, (textwrap.wrap(text, width=max(4, int(box_w / max(f.getlength('М'), 1)))) or [text]), 13
+
+    # однотонність фону: яку частку площі займає домінантний колір
+    q = cover.resize((80, 120)).quantize(colors=6).convert("RGB")
+    qc = sorted(q.getcolors(80 * 120) or [(1, (0, 0, 0))], key=lambda c: -c[0])
+    uniform = qc[0][0] / (80 * 120) > 0.5
+
+    # ============ РЕЖИМ ЗАМІНИ (однотонний фон) ============
+    if uniform and tlines:
+        work = cover.copy()
+        wd = ImageDraw.Draw(work)
+
+        def replace_block(group, text):
+            if not group or not text:
+                return
+            x0 = min(l["bbox"][0] for l in group) * M
+            y0 = min(l["bbox"][1] for l in group) * M
+            x1 = max(l["bbox"][2] for l in group) * M
+            y1 = max(l["bbox"][3] for l in group) * M
+            bg = _sample_bg(work, x0, y0, x1, y1, pad=12)
+            wd.rectangle([x0 - 4, y0 - 4, x1 + 4, y1 + 4], fill=bg)
+            tc = (255, 255, 255) if _lum(bg) < 130 else (20, 20, 20)
+            per_line = (y1 - y0) / max(len(group), 1)
+            f, wr, sz = fit_font(text.upper(), (x1 - x0) * 1.15, (y1 - y0) * 1.4, per_line * 1.05)
+            yy = y0
+            for ln in wr:
+                w = f.getlength(ln)
+                wd.text((x0 + ((x1 - x0) - w) / 2, yy), ln, font=f, fill=tc)
+                yy += sz * 1.12
+
+        replace_block(tlines, t_title)
+        replace_block(alines, t_author)
+        out = io.BytesIO(); work.save(out, "PNG")
+        return out.getvalue()
+
+    # ============ РЕЖИМ ГЕНЕРАЦІЇ (складний фон) ============
     W = 1000
-    H = max(1200, min(int(W * aspect), 1500))
-    # фон-градієнт між двома виразними кольорами палітри
+    H = max(1200, min(int(W * (cover.height / max(cover.width, 1))), 1500))
     c1 = max(pal[:3], key=lambda c: abs(_lum(c) - 110))
     c2 = pal[1] if len(pal) > 1 else c1
     base = Image.new("RGB", (W, H), c1)
     top = Image.new("RGB", (W, H), c2)
-    mask = Image.new("L", (W, H))
-    md = ImageDraw.Draw(mask)
+    mask = Image.new("L", (W, H)); md = ImageDraw.Draw(mask)
     for y in range(H):
         md.line([(0, y), (W, y)], fill=int(255 * y / H))
     base = Image.composite(base, top, mask).convert("RGBA")
-    # м'які painterly-форми у палітрі (окремі елементи)
-    blob = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    bd = ImageDraw.Draw(blob)
+    blob = Image.new("RGBA", (W, H), (0, 0, 0, 0)); bd = ImageDraw.Draw(blob)
     random.seed(len(pdf_bytes))
     for i in range(6):
         col = pal[i % len(pal)]
@@ -661,35 +731,19 @@ def make_cover(pdf_bytes, api_key, provider="gemini", model=None,
         bd.ellipse([x - r, y - r, x + r, y + r], fill=(col[0], col[1], col[2], 70))
     base = Image.alpha_composite(base, blob.filter(ImageFilter.GaussianBlur(70))).convert("RGB")
     draw = ImageDraw.Draw(base)
-
     txt_col = (255, 255, 255) if _lum(c1) < 140 else (25, 25, 25)
     accent = max(pal, key=lambda c: (max(c) - min(c)))
-    fb = _FONTS[("sans", True, False)]
-
-    # заголовок: підбираємо кегль і переносимо
-    title_up = t_title.upper()
-    size = 88
-    wrapped = [title_up]
-    while size > 30:
-        font = ImageFont.truetype(fb, size)
-        maxchars = max(6, int((W - 150) / max(font.getlength("М"), 1)))
-        wrapped = textwrap.wrap(title_up, width=maxchars)
-        if len(wrapped) * size * 1.15 < H * 0.5 and len(wrapped) <= 6:
-            break
-        size -= 4
+    font, wrapped, size = fit_font(t_title.upper(), W - 150, H * 0.5, 88)
     y = H * 0.20
     for line in wrapped:
         w = font.getlength(line)
         draw.text(((W - w) / 2, y), line, font=font, fill=txt_col)
         y += size * 1.15
-    # акцент-лінія
     ly = y + 28
     draw.rectangle([W * 0.36, ly, W * 0.64, ly + 7], fill=accent)
-    # автор
     if t_author:
         af = ImageFont.truetype(fb, 42)
         aw = af.getlength(t_author.upper())
         draw.text(((W - aw) / 2, H * 0.83), t_author.upper(), font=af, fill=txt_col)
-
     out = io.BytesIO(); base.save(out, "PNG")
     return out.getvalue()
