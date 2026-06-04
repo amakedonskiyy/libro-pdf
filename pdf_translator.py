@@ -157,6 +157,11 @@ _GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 _GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 _DELIM = "\n<<<§>>>\n"
 
+
+class _ClientError(Exception):
+    """4xx від провайдера (поганий ключ/модель/доступ) — повторювати марно."""
+    pass
+
 _SYS_PROMPT = (
     "Ти — професійний літературний перекладач книжок.\n"
     "Перекладай з {src} на {dst}.\n"
@@ -231,16 +236,18 @@ def _groq_call(api_key, model, system, user, timeout=120, max_retries=8):
     raise RuntimeError(f"Groq не відповів після {max_retries} спроб: {last_err}")
 
 
-def _gemini_call(api_key, model, system, user, timeout=120, max_retries=8):
-    """Виклик Gemini (Google AI) з повтором при лімітах/збоях."""
+def _gemini_call(api_key, model, system, user, timeout=120, max_retries=5):
+    """Виклик Gemini (Google AI). 4xx (крім 429) — одразу падаємо з причиною."""
     url = f"{_GEMINI_BASE}/{model}:generateContent"
     delay = 3.0
     last_err = None
     for attempt in range(max_retries):
         try:
             r = requests.post(
-                url, params={"key": api_key},
-                headers={"Content-Type": "application/json"},
+                url,
+                params={"key": api_key},
+                headers={"Content-Type": "application/json",
+                         "x-goog-api-key": api_key},
                 json={
                     "systemInstruction": {"parts": [{"text": system}]},
                     "contents": [{"role": "user", "parts": [{"text": user}]}],
@@ -252,23 +259,21 @@ def _gemini_call(api_key, model, system, user, timeout=120, max_retries=8):
                 ra = r.headers.get("retry-after")
                 wait = float(ra) if ra else delay
                 print(f"Gemini {r.status_code}, чекаю {wait:.0f}с (спроба {attempt+1})")
-                time.sleep(min(wait, 90))
-                delay = min(delay * 2, 90)
+                time.sleep(min(wait, 30))
+                delay = min(delay * 2, 30)
                 continue
-            r.raise_for_status()
+            if r.status_code >= 400:
+                raise _ClientError(f"Gemini {r.status_code}: {r.text[:300]}")
             cands = r.json().get("candidates", [])
             if not cands:
-                raise RuntimeError("порожня відповідь (можливо, фільтр безпеки)")
+                raise _ClientError("Gemini: порожня відповідь (фільтр безпеки?)")
             parts = cands[0].get("content", {}).get("parts", [])
             return "".join(p.get("text", "") for p in parts)
         except requests.RequestException as e:
             last_err = e
             time.sleep(delay)
-            delay = min(delay * 2, 90)
-        except RuntimeError as e:
-            last_err = e
-            break
-    raise RuntimeError(f"Gemini не відповів: {last_err}")
+            delay = min(delay * 2, 30)
+    raise RuntimeError(f"Gemini не відповів (мережа): {last_err}")
 
 
 def _llm_call(provider, api_key, model, system, user):
@@ -331,6 +336,8 @@ def translate_blocks(texts, api_key, provider="gemini", model=None,
                 for k, idx in enumerate(batch):
                     out[idx] = parts[k] or texts[idx]
                 ok = True
+        except _ClientError:
+            raise
         except Exception as e:
             print("batch error:", e)
         if not ok:
@@ -338,6 +345,8 @@ def translate_blocks(texts, api_key, provider="gemini", model=None,
                 try:
                     out[idx] = _llm_call(provider, api_key, model, system,
                                          texts[idx]).strip() or texts[idx]
+                except _ClientError:
+                    raise
                 except Exception as e:
                     print("single error:", e)
                     out[idx] = texts[idx]
