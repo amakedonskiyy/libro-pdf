@@ -106,17 +106,17 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
 
         pages = P.extract_blocks(pdf_bytes, ocr_lang=P._LANG_OCR.get(src, "rus"))
         if P.looks_scanned(pages):
-            JOBS[job_id].update(status="error", error=(
-                "Схоже, це скан-книга (сторінки — зображення без тексту шару). "
-                "Поточний рушій перекладає книги з текстовим шаром. "
-                "Для сканів потрібен окремий OCR-режим (у планах)."))
-            return
-        flat = [(b["id"], b["text"]) for blk in pages for b in blk]
-        tr = P.translate_blocks([t for _, t in flat], api_key, provider=provider,
-                                model=model or None, src=src, dst=dst,
-                                proofread=proofread, progress_cb=cb)
-        tmap = {flat[i][0]: tr[i] for i in range(len(flat))}
-        out = P.build_pdf(pdf_bytes, pages, tmap)
+            # СКАН-книга -> OCR-режим (рендер -> OCR -> переклад -> накладання)
+            out = P.translate_scanned_pdf(pdf_bytes, api_key, provider=provider,
+                                          model=model or None, src=src, dst=dst,
+                                          proofread=proofread, progress_cb=cb)
+        else:
+            flat = [(b["id"], b["text"]) for blk in pages for b in blk]
+            tr = P.translate_blocks([t for _, t in flat], api_key, provider=provider,
+                                    model=model or None, src=src, dst=dst,
+                                    proofread=proofread, progress_cb=cb)
+            tmap = {flat[i][0]: tr[i] for i in range(len(flat))}
+            out = P.build_pdf(pdf_bytes, pages, tmap)
         path = os.path.join(JOB_DIR, f"{job_id}.pdf")
         with open(path, "wb") as f:
             f.write(out)
@@ -191,15 +191,16 @@ def _run_job(pdf_bytes, translation_id, api_key, provider, model, src, dst,
 
         pages = P.extract_blocks(pdf_bytes, ocr_lang=P._LANG_OCR.get(src, "rus"))
         if P.looks_scanned(pages):
-            supa_update(translation_id, status="error", error=(
-                "Схоже, це скан-книга без текстового шару. Потрібен OCR-режим (у планах)."))
-            return
-        flat = [(b["id"], b["text"]) for blocks in pages for b in blocks]
-        tr = P.translate_blocks([t for _, t in flat], api_key, provider=provider,
-                                model=model or None, src=src, dst=dst,
-                                proofread=proofread, progress_cb=cb)
-        tmap = {flat[i][0]: tr[i] for i in range(len(flat))}
-        out = P.build_pdf(pdf_bytes, pages, tmap)
+            out = P.translate_scanned_pdf(pdf_bytes, api_key, provider=provider,
+                                          model=model or None, src=src, dst=dst,
+                                          proofread=proofread, progress_cb=cb)
+        else:
+            flat = [(b["id"], b["text"]) for blocks in pages for b in blocks]
+            tr = P.translate_blocks([t for _, t in flat], api_key, provider=provider,
+                                    model=model or None, src=src, dst=dst,
+                                    proofread=proofread, progress_cb=cb)
+            tmap = {flat[i][0]: tr[i] for i in range(len(flat))}
+            out = P.build_pdf(pdf_bytes, pages, tmap)
         supa_update(translation_id, progress=97)
         base = (filename or "book").rsplit(".", 1)[0]
         url = supa_upload_result(f"{translation_id}/{base}_uk.pdf", out)

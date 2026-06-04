@@ -492,3 +492,98 @@ def translate_pdf(pdf_bytes, api_key, provider="gemini", model=None,
                                   progress_cb=progress_cb)
     tmap = {ids[k]: translated[k] for k in range(len(ids))}
     return build_pdf(pdf_bytes, pages, tmap)
+
+
+# ================================================================
+#                  OCR-РЕЖИМ ДЛЯ СКАН-КНИГ (Варіант А)
+# ================================================================
+def _ocr_lines(page, lang="rus", dpi=200, min_conf=35):
+    """OCR сторінки -> рядки [{text, bbox(в пунктах сторінки), bg(rgb 0..1)}]."""
+    import pytesseract
+    from PIL import Image
+    zoom = dpi / 72.0
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+    img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+    data = pytesseract.image_to_data(img, lang=lang,
+                                     output_type=pytesseract.Output.DICT)
+    groups = {}
+    for i in range(len(data["text"])):
+        txt = data["text"][i].strip()
+        try:
+            conf = float(data["conf"][i])
+        except (ValueError, TypeError):
+            conf = -1
+        if not txt or conf < min_conf:
+            continue
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        x, y, w, h = (data["left"][i], data["top"][i],
+                      data["width"][i], data["height"][i])
+        g = groups.setdefault(key, {"w": [], "x0": 1e9, "y0": 1e9, "x1": 0, "y1": 0})
+        g["w"].append(txt)
+        g["x0"] = min(g["x0"], x); g["y0"] = min(g["y0"], y)
+        g["x1"] = max(g["x1"], x + w); g["y1"] = max(g["y1"], y + h)
+    lines = []
+    for g in groups.values():
+        # домінантний колір ділянки = фон (парчмент/папір)
+        try:
+            crop = img.crop((g["x0"], g["y0"], g["x1"], g["y1"]))
+            cs = crop.getcolors(maxcolors=200000)
+            bg = max(cs, key=lambda c: c[0])[1] if cs else (255, 255, 255)
+        except Exception:
+            bg = (255, 255, 255)
+        lines.append({
+            "text": " ".join(g["w"]),
+            "bbox": (g["x0"] / zoom, g["y0"] / zoom, g["x1"] / zoom, g["y1"] / zoom),
+            "bg": (bg[0] / 255, bg[1] / 255, bg[2] / 255),
+        })
+    lines.sort(key=lambda l: (round(l["bbox"][1] / 5), l["bbox"][0]))
+    return lines
+
+
+def translate_scanned_pdf(pdf_bytes, api_key, provider="gemini", model=None,
+                          src="ru", dst="uk", proofread=False, progress_cb=None):
+    """Скан-книга: OCR кожної сторінки -> переклад -> накладання поверх скану."""
+    lang = _LANG_OCR.get(src, "rus")
+    src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    # --- 1. OCR усіх сторінок (тримаємо лише текст+координати, не картинки) ---
+    page_lines, texts, index = [], [], []
+    for pno in range(src_doc.page_count):
+        lines = _ocr_lines(src_doc[pno], lang)
+        page_lines.append(lines)
+        for li, l in enumerate(lines):
+            texts.append(l["text"]); index.append((pno, li))
+
+    # --- 2. переклад усіх рядків (той самий рушій, провайдер, редактор) ---
+    translated = translate_blocks(texts, api_key, provider=provider, model=model,
+                                  src=src, dst=dst, proofread=proofread,
+                                  progress_cb=progress_cb)
+    for k, (pno, li) in enumerate(index):
+        page_lines[pno][li]["uk"] = translated[k]
+
+    # --- 3. збірка: оригінальний скан як фон + накладений переклад ---
+    fontfile = _FONTS[("serif", False, False)]
+    out_doc = fitz.open()
+    for pno in range(src_doc.page_count):
+        rect = src_doc[pno].rect
+        newp = out_doc.new_page(width=rect.width, height=rect.height)
+        newp.show_pdf_page(rect, src_doc, pno)        # оригінальний скан як фон
+        for l in page_lines[pno]:
+            uk = l.get("uk", "").strip()
+            if not uk:
+                continue
+            x0, y0, x1, y1 = l["bbox"]
+            box = fitz.Rect(x0, y0, x1, y1)
+            newp.draw_rect(box, color=None, fill=l["bg"])   # замазати оригінал фоном
+            # вписуємо переклад, зменшуючи кегль, поки влізе
+            grow = fitz.Rect(x0, y0, x1 + (x1 - x0) * 0.8, y1 + (y1 - y0) * 1.2)
+            size = max(6.0, (y1 - y0) * 0.85)
+            for _ in range(6):
+                rc = newp.insert_textbox(grow, uk, fontfile=fontfile, fontname="ocr",
+                                         fontsize=size, color=(0, 0, 0), align=0)
+                if rc >= 0:
+                    break
+                size *= 0.85
+    result = out_doc.tobytes(deflate=True, garbage=4)
+    src_doc.close(); out_doc.close()
+    return result
