@@ -412,32 +412,46 @@ def proofread_blocks(originals, drafts, api_key, provider, model, src, dst,
 
 
 # ---------------------------------------------------------------- 3. build
-def _place_text(page, bbox, text, fontname, fontfile, color, size):
-    """Вставляє text у прямокутник bbox. Спершу зменшує шрифт, потім, якщо
-    треба, нарощує висоту прямокутника вниз. Повертає True, якщо вмістив."""
+def _place_text(page, bbox, text, fontname, fontfile, color, size,
+                col_right=None):
+    """Вставляє text у прямокутник. Тримає ОДИН розмір шрифту, переносить
+    рядки В МЕЖАХ КОЛОНКИ і за потреби нарощує висоту вниз. Шрифт зменшує
+    лише як крайній засіб (щоб слово не вилазило за край). col_right — права
+    межа колонки (щоб текст не ліз на сусідів і не вилазив за поле сторінки).
+    Повертає True, якщо вмістив."""
     x0, y0, x1, y1 = bbox
     page_r = page.rect
-    width = max(x1, x0 + 40)
-    for extra in (0, 6, 14, 26, 44, 70):
-        rect = fitz.Rect(x0 - 1, y0 - 1,
-                         min(width + 2, page_r.x1 - 2),
-                         min(y1 + 3 + extra, page_r.y1 - 2))
-        sz = size
-        while sz >= 5:
+    margin = 2.0
+    left = max(x0, margin)
+    # права межа: ширина оригінального блоку, але НІКОЛИ не за поле сторінки
+    right = min(col_right if col_right else x1, page_r.x1 - margin)
+    if right <= left + 20:                      # дуже вузький блок — дамо мінімум
+        right = min(left + 130, page_r.x1 - margin)
+    bottom_cap = page_r.y1 - margin
+    min_sz = max(6.0, size * 0.7)               # не дрібнимо більш ніж на 30%
+    # 1) тримаємо розмір, нарощуємо висоту вниз; 2) лише потім трохи зменшуємо
+    sz = float(size)
+    while sz >= min_sz:
+        for extra in (0, 8, 18, 32, 52, 80, 120):
+            bot = min(y1 + 2 + extra, bottom_cap)
+            rect = fitz.Rect(left - 1, y0 - 1, right, bot)
             rc = page.insert_textbox(rect, text, fontsize=sz, fontname=fontname,
                                      fontfile=fontfile, color=color, align=0)
             if rc >= 0:
                 return True
-            sz -= 0.5
-    # зовсім не влізло — вставляємо найменшим, обрізане (краще ніж нічого)
-    page.insert_textbox(fitz.Rect(x0 - 1, y0 - 1, page_r.x1 - 2, page_r.y1 - 2),
-                        text, fontsize=5, fontname=fontname, fontfile=fontfile,
-                        color=color, align=0)
+        sz -= 0.5
+    # крайній випадок: у колонку до низу сторінки найменшим допустимим розміром
+    page.insert_textbox(fitz.Rect(left - 1, y0 - 1, right, bottom_cap),
+                        text, fontsize=min_sz, fontname=fontname,
+                        fontfile=fontfile, color=color, align=0)
     return False
 
 
-def _sample_bg(img, x0, y0, x1, y1, pad=6):
-    """Домінантний колір РАМКИ навколо боксу (фон сторінки біля тексту), rgb 0..255."""
+def _sample_bg(img, x0, y0, x1, y1, pad=14):
+    """Надійний колір фону навколо боксу. Беремо широку рамку, КВАНТУЄМО
+    кольори (крок 12), щоб шум текстури/градієнта злився в один тон, і
+    повертаємо домінантний тон. Стійко до пергаменту/кремових/кольорових
+    сторінок (не дає білих плям). rgb 0..255."""
     W, H = img.size
     x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
     bands = [(x0 - pad, y0 - pad, x1 + pad, y0), (x0 - pad, y1, x1 + pad, y1 + pad),
@@ -450,8 +464,12 @@ def _sample_bg(img, x0, y0, x1, y1, pad=6):
             continue
         crop = img.crop((bx0, by0, bx1, by1)).convert("RGB")
         for c, col in (crop.getcolors(crop.width * crop.height) or []):
-            cnt[col] = cnt.get(col, 0) + c
-    return max(cnt.items(), key=lambda kv: kv[1])[0] if cnt else (255, 255, 255)
+            q = (col[0] // 12 * 12, col[1] // 12 * 12, col[2] // 12 * 12)
+            cnt[q] = cnt.get(q, 0) + c
+    if not cnt:
+        return (255, 255, 255)
+    best = max(cnt.items(), key=lambda kv: kv[1])[0]   # найчастіший тон рамки
+    return (min(255, best[0] + 6), min(255, best[1] + 6), min(255, best[2] + 6))
 
 
 def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
@@ -463,6 +481,16 @@ def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
     recipe         — правила від зору (напр. {"uniform_bg":true,"page_bg":[245,240,225]}).
     Повертає bytes готового PDF.
     """
+def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
+              keep_image_bg=True, recipe=None):
+    """
+    pdf_bytes      — оригінальний PDF.
+    pages_blocks   — результат extract_blocks().
+    translations   — {block_id: "переклад"}.
+    recipe         — правила від зору (напр. {"uniform_bg":true,"page_bg":[245,240,225]}).
+    Повертає bytes готового PDF.
+    """
+    import statistics
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     recipe = recipe or {}
     # глобальний колір фону від зору (якщо книга однотонна) — 0..1
@@ -473,20 +501,41 @@ def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
             continue
         page = doc[blocks[0]["page"]]
         page_r = page.rect
-        # рендеримо сторінку (раз) ЛИШЕ якщо немає глобального фону і є зображення —
-        # щоб брати колір фону під блоком і не лишати білих плям на кольорі/картинці
+
+        # --- беремо лише блоки з НЕПОРОЖНІМ перекладом ---
+        # (непереведені абзаци не чіпаємо: лишаємо чистий оригінал,
+        #  без плашки і без подвійного тексту)
+        live = [b for b in blocks if (translations.get(b["id"]) or "").strip()]
+        if not live:
+            continue
+
+        # --- ОДИН рівний розмір основного тексту на сторінку ---
+        # (мода розмірів блоків -> прибирає "стрибаючий шрифт")
+        sizes = [max(1, round(b["size"])) for b in live]
+        try:
+            body = statistics.mode(sizes)
+        except statistics.StatisticsError:
+            body = round(statistics.median(sizes))
+        body = max(6, min(int(body), 16))
+        heading_cut = body * 1.5                # помітно більший блок = заголовок
+
+        # --- рендеримо сторінку (раз) для підбору кольору фону ---
+        # ЗАВЖДИ (не лише за наявності картинок): так кремові/пергаментні
+        # сторінки заливаються своїм тоном, а не білим.
         pimg, zoom = None, 2.0
-        if uni_bg is None and page.get_images():
+        if uni_bg is None:
             try:
                 from PIL import Image
                 pm = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
                 pimg = Image.open(io.BytesIO(pm.tobytes("png"))).convert("RGB")
             except Exception:
                 pimg = None
-        # 3a. РЕДАКЦІЯ: фізично видаляємо оригінальний текст, заливаючи ФОНОМ
-        for b in blocks:
+
+        # 3a. РЕДАКЦІЯ: фізично видаляємо оригінал ЛИШЕ під перекладеними блоками,
+        #     заливаючи справжнім тоном фону.
+        for b in live:
             r = fitz.Rect(b["bbox"])
-            r.x0 -= 1; r.y0 -= 1; r.x1 += 1; r.y1 += 1
+            r.x0 -= 1.5; r.y0 -= 1.5; r.x1 += 1.5; r.y1 += 1.5
             r = r & page_r                      # обов'язково в межах сторінки!
             if r.is_empty:
                 continue
@@ -499,16 +548,16 @@ def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
             else:
                 fill = (1, 1, 1)
             page.add_redact_annot(r, fill=fill)
-        # зображення НЕ чіпаємо
+        # текст видаляємо (default), зображення НЕ чіпаємо
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
-        # 3b. Вставляємо переклад на ті самі координати
-        for b in blocks:
-            tgt = translations.get(b["id"], b["text"])
-            if not tgt:
-                continue
+        # 3b. Вставляємо переклад: основний текст — рівним розміром body,
+        #     заголовки лишають свій (більший) розмір. Усе зажате по ширині блоку.
+        for b in live:
+            tgt = translations.get(b["id"])
+            place_sz = b["size"] if b["size"] >= heading_cut else body
             _place_text(page, b["bbox"], tgt, b["fontname"], b["fontfile"],
-                        b["color"], b["size"])
+                        b["color"], place_sz, col_right=b["bbox"][2])
 
     out = io.BytesIO()
     doc.save(out, garbage=4, deflate=True)      # стиснення + дедуп шрифтів
