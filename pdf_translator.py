@@ -571,17 +571,23 @@ def translate_scanned_pdf(pdf_bytes, api_key, provider="gemini", model=None,
     src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     # --- 1. OCR усіх сторінок (тримаємо лише текст+координати, не картинки) ---
+    npages = max(src_doc.page_count, 1)
     page_lines, texts, index = [], [], []
     for pno in range(src_doc.page_count):
         lines = _ocr_lines(src_doc[pno], lang)
         page_lines.append(lines)
         for li, l in enumerate(lines):
             texts.append(l["text"]); index.append((pno, li))
+        if progress_cb:                       # OCR займає шкалу 0..40%
+            progress_cb(int(40 * (pno + 1) / npages), 100)
 
     # --- 2. переклад усіх рядків (той самий рушій, провайдер, редактор) ---
+    def _shim(done, total):                   # переклад займає 40..98%
+        if progress_cb:
+            progress_cb(40 + int(58 * done / max(total, 1)), 100)
     translated = translate_blocks(texts, api_key, provider=provider, model=model,
                                   src=src, dst=dst, proofread=proofread,
-                                  progress_cb=progress_cb)
+                                  progress_cb=_shim)
     for k, (pno, li) in enumerate(index):
         page_lines[pno][li]["uk"] = translated[k]
 
