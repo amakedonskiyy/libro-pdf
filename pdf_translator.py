@@ -209,9 +209,8 @@ _EDITOR_PROMPT = (
 _LANG = {"ru": "російської", "en": "англійської", "uk": "українську", "ua": "українську"}
 
 
-def _groq_call(api_key, model, system, user, timeout=120, max_retries=8):
-    """Виклик Groq з терпеливим повтором при лімітах (429) і збоях сервера (5xx).
-    Поважає заголовок Retry-After, інакше — експоненційна затримка."""
+def _groq_call(api_key, model, system, user, timeout=120, max_retries=5):
+    """Виклик Groq. 429/5xx — терплячий повтор; 4xx (погана модель/ключ) — одразу падаємо."""
     delay = 3.0
     last_err = None
     for attempt in range(max_retries):
@@ -234,16 +233,17 @@ def _groq_call(api_key, model, system, user, timeout=120, max_retries=8):
                 ra = r.headers.get("retry-after")
                 wait = float(ra) if ra else delay
                 print(f"Groq {r.status_code}, чекаю {wait:.0f}с (спроба {attempt+1})")
-                time.sleep(min(wait, 90))
-                delay = min(delay * 2, 90)
+                time.sleep(min(wait, 30))
+                delay = min(delay * 2, 30)
                 continue
-            r.raise_for_status()
+            if r.status_code >= 400:
+                raise _ClientError(f"Groq {r.status_code}: {r.text[:300]}")
             return r.json()["choices"][0]["message"]["content"]
         except requests.RequestException as e:
             last_err = e
             time.sleep(delay)
-            delay = min(delay * 2, 90)
-    raise RuntimeError(f"Groq не відповів після {max_retries} спроб: {last_err}")
+            delay = min(delay * 2, 30)
+    raise RuntimeError(f"Groq не відповів (мережа): {last_err}")
 
 
 def _gemini_call(api_key, model, system, user, timeout=120, max_retries=5):
