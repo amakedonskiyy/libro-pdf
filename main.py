@@ -98,31 +98,43 @@ def translate_sync(file: UploadFile = File(...), api_key: str = Form(...),
 # ----------- ФОНОВА ЧЕРГА без Supabase (для великих книг через браузер) -----------
 def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
                    proofread, filename):
+    import sys
+    def log(m):
+        print(f"[job {job_id}] {m}", flush=True); sys.stdout.flush()
     try:
         JOBS[job_id].update(status="processing", progress=1)
+        log(f"start: {len(pdf_bytes)//1024}KB, provider={provider}, model={model!r}, src={src}")
 
         def cb(done, total):
             JOBS[job_id]["progress"] = max(1, min(99, int(done / max(total, 1) * 99)))
 
+        log("extract_blocks...")
         pages = P.extract_blocks(pdf_bytes, ocr_lang=P._LANG_OCR.get(src, "rus"))
-        if P.looks_scanned(pages):
-            # СКАН-книга -> OCR-режим (рендер -> OCR -> переклад -> накладання)
+        nb = sum(len(p) for p in pages)
+        scanned = P.looks_scanned(pages)
+        log(f"extracted: pages={len(pages)}, blocks={nb}, scanned={scanned}")
+        if scanned:
+            log("scanned mode -> OCR all pages...")
             out = P.translate_scanned_pdf(pdf_bytes, api_key, provider=provider,
                                           model=model or None, src=src, dst=dst,
                                           proofread=proofread, progress_cb=cb)
         else:
             flat = [(b["id"], b["text"]) for blk in pages for b in blk]
+            log(f"translate_blocks: {len(flat)} blocks...")
             tr = P.translate_blocks([t for _, t in flat], api_key, provider=provider,
                                     model=model or None, src=src, dst=dst,
                                     proofread=proofread, progress_cb=cb)
+            log("build_pdf...")
             tmap = {flat[i][0]: tr[i] for i in range(len(flat))}
             out = P.build_pdf(pdf_bytes, pages, tmap)
+        log(f"done: {len(out)//1024}KB")
         path = os.path.join(JOB_DIR, f"{job_id}.pdf")
         with open(path, "wb") as f:
             f.write(out)
         JOBS[job_id].update(status="done", progress=100, path=path)
     except Exception as e:
         traceback.print_exc()
+        log(f"ERROR: {e}")
         JOBS[job_id].update(status="error", error=str(e)[:500])
 
 
