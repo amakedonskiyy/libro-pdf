@@ -790,7 +790,8 @@ _VISION_PROMPT = (
 )
 
 
-def _page_images_b64(pdf_bytes, n=10, width=820):
+def _page_images_b64(pdf_bytes, n=5, width=560):
+    """Перші n сторінок як невеликі JPEG (щоб не перевищити ліміт розміру запиту)."""
     import base64
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out = []
@@ -798,14 +799,21 @@ def _page_images_b64(pdf_bytes, n=10, width=820):
         pg = doc[pno]
         zoom = width / max(pg.rect.width, 1)
         pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-        out.append(base64.b64encode(pix.tobytes("png")).decode())
+        try:
+            from PIL import Image
+            img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+            buf = io.BytesIO(); img.save(buf, "JPEG", quality=70)
+            data = buf.getvalue()
+        except Exception:
+            data = pix.tobytes("jpeg")
+        out.append(base64.b64encode(data).decode())
     doc.close()
     return out
 
 
 def _vision_call(provider, api_key, model, prompt, images_b64, timeout=120):
     if provider == "gemini":
-        parts = [{"text": prompt}] + [{"inline_data": {"mime_type": "image/png", "data": b}}
+        parts = [{"text": prompt}] + [{"inline_data": {"mime_type": "image/jpeg", "data": b}}
                                       for b in images_b64]
         r = requests.post(
             f"{_GEMINI_BASE}/{model}:generateContent",
@@ -820,7 +828,7 @@ def _vision_call(provider, api_key, model, prompt, images_b64, timeout=120):
         return "".join(p.get("text", "") for p in cands[0]["content"]["parts"]) if cands else ""
     # groq / openai-сумісний
     content = [{"type": "text", "text": prompt}] + [
-        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b}"}}
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b}"}}
         for b in images_b64]
     r = requests.post(
         _GROQ_URL,
@@ -838,7 +846,7 @@ def _default_vision_model(provider):
             else "meta-llama/llama-4-scout-17b-16e-instruct")
 
 
-def analyze_book(pdf_bytes, api_key, provider="groq", model=None, n=10):
+def analyze_book(pdf_bytes, api_key, provider="groq", model=None, n=5):
     """Зір дивиться перші n сторінок -> правила (recipe) для всієї книги.
     На будь-якій помилці повертає {} (движок працює як без зору)."""
     import json, re
