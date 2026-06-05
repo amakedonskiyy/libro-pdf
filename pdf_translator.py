@@ -455,24 +455,28 @@ def _sample_bg(img, x0, y0, x1, y1, pad=6):
 
 
 def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
-              keep_image_bg=True):
+              keep_image_bg=True, recipe=None):
     """
     pdf_bytes      — оригінальний PDF.
     pages_blocks   — результат extract_blocks().
     translations   — {block_id: "переклад"}.
+    recipe         — правила від зору (напр. {"uniform_bg":true,"page_bg":[245,240,225]}).
     Повертає bytes готового PDF.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    recipe = recipe or {}
+    # глобальний колір фону від зору (якщо книга однотонна) — 0..1
+    uni_bg = _rgb01(recipe["page_bg"]) if (recipe.get("uniform_bg") and recipe.get("page_bg")) else None
 
     for blocks in pages_blocks:
         if not blocks:
             continue
         page = doc[blocks[0]["page"]]
         page_r = page.rect
-        # рендеримо сторінку (раз) ЛИШЕ якщо на ній є зображення — щоб брати
-        # колір фону під блоком і не лишати білих плям на кольорі/картинці
+        # рендеримо сторінку (раз) ЛИШЕ якщо немає глобального фону і є зображення —
+        # щоб брати колір фону під блоком і не лишати білих плям на кольорі/картинці
         pimg, zoom = None, 2.0
-        if page.get_images():
+        if uni_bg is None and page.get_images():
             try:
                 from PIL import Image
                 pm = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
@@ -486,11 +490,14 @@ def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
             r = r & page_r                      # обов'язково в межах сторінки!
             if r.is_empty:
                 continue
-            fill = (1, 1, 1)
-            if pimg is not None:
+            if uni_bg is not None:               # зір: один колір на всю книгу
+                fill = uni_bg
+            elif pimg is not None:               # підбір під фон сторінки
                 x0, y0, x1, y1 = b["bbox"]
                 c = _sample_bg(pimg, x0 * zoom, y0 * zoom, x1 * zoom, y1 * zoom)
                 fill = (c[0] / 255, c[1] / 255, c[2] / 255)
+            else:
+                fill = (1, 1, 1)
             page.add_redact_annot(r, fill=fill)
         # зображення НЕ чіпаємо
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
@@ -651,7 +658,7 @@ def _cover_lines(doc, ocr_lang="rus"):
 
 
 def make_cover(pdf_bytes, api_key, provider="gemini", model=None,
-               src="ru", dst="uk", title=None, author=None):
+               src="ru", dst="uk", title=None, author=None, recipe=None):
     """Однотонний фон -> заміна назви НА МІСЦІ (оригінал лишається).
     Складний фон -> нова обкладинка у стилі оригіналу. Текст завжди наш (чіткий)."""
     from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -688,6 +695,11 @@ def make_cover(pdf_bytes, api_key, provider="gemini", model=None,
     q = cover.resize((80, 120)).quantize(colors=6).convert("RGB")
     qc = sorted(q.getcolors(80 * 120) or [(1, (0, 0, 0))], key=lambda c: -c[0])
     uniform = qc[0][0] / (80 * 120) > 0.5
+    cm = (recipe or {}).get("cover_mode")          # зір може перевизначити
+    if cm == "replace":
+        uniform = True
+    elif cm == "generate":
+        uniform = False
 
     # ============ РЕЖИМ ЗАМІНИ (однотонний фон) ============
     if uniform and tlines:
@@ -753,3 +765,97 @@ def make_cover(pdf_bytes, api_key, provider="gemini", model=None,
         draw.text(((W - aw) / 2, H * 0.83), t_author.upper(), font=af, fill=txt_col)
     out = io.BytesIO(); base.save(out, "PNG")
     return out.getvalue()
+
+
+# ================================================================
+#         ЗІР: аналіз перших N сторінок -> правила (recipe)
+# ================================================================
+_VISION_PROMPT = (
+    "You analyze pages of a book to set rendering parameters for a tool that ERASES "
+    "the original text and writes translated text in its place. Look at page "
+    "backgrounds and text colour. Return ONLY a JSON object, no prose, no markdown:\n"
+    '{"uniform_bg": true|false, "page_bg": [r,g,b] or null, '
+    '"text_color": [r,g,b] or null, "scanned": true|false, '
+    '"cover_mode": "replace" or "generate", "cover_bg": [r,g,b] or null}\n'
+    "Rules:\n"
+    "- uniform_bg=true ONLY if the CONTENT pages share one consistent background colour "
+    "(all white, or all the same cream/parchment/dark). page_bg = that colour in 0-255 RGB.\n"
+    "- If backgrounds vary (white text pages mixed with coloured pages or photos), "
+    "uniform_bg=false and page_bg=null.\n"
+    "- text_color = the main body text colour in 0-255 RGB (usually dark).\n"
+    "- scanned=true if pages are photographed/scanned images, not crisp digital text.\n"
+    "- cover_mode='replace' if the FIRST page (cover) has a flat area where the title can be "
+    "overwritten in place; 'generate' if the cover is a busy photo/illustration.\n"
+    "- cover_bg = the cover's dominant background colour in 0-255 RGB."
+)
+
+
+def _page_images_b64(pdf_bytes, n=10, width=820):
+    import base64
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    out = []
+    for pno in range(min(n, doc.page_count)):
+        pg = doc[pno]
+        zoom = width / max(pg.rect.width, 1)
+        pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+        out.append(base64.b64encode(pix.tobytes("png")).decode())
+    doc.close()
+    return out
+
+
+def _vision_call(provider, api_key, model, prompt, images_b64, timeout=120):
+    if provider == "gemini":
+        parts = [{"text": prompt}] + [{"inline_data": {"mime_type": "image/png", "data": b}}
+                                      for b in images_b64]
+        r = requests.post(
+            f"{_GEMINI_BASE}/{model}:generateContent",
+            params={"key": api_key},
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+            json={"contents": [{"role": "user", "parts": parts}],
+                  "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1024}},
+            timeout=timeout)
+        if r.status_code >= 400:
+            raise _ClientError(f"Gemini vision {r.status_code}: {r.text[:300]}")
+        cands = r.json().get("candidates", [])
+        return "".join(p.get("text", "") for p in cands[0]["content"]["parts"]) if cands else ""
+    # groq / openai-сумісний
+    content = [{"type": "text", "text": prompt}] + [
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b}"}}
+        for b in images_b64]
+    r = requests.post(
+        _GROQ_URL,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={"model": model, "temperature": 0.1,
+              "messages": [{"role": "user", "content": content}]},
+        timeout=timeout)
+    if r.status_code >= 400:
+        raise _ClientError(f"Groq vision {r.status_code}: {r.text[:300]}")
+    return r.json()["choices"][0]["message"]["content"]
+
+
+def _default_vision_model(provider):
+    return ("gemini-2.5-flash" if provider == "gemini"
+            else "meta-llama/llama-4-scout-17b-16e-instruct")
+
+
+def analyze_book(pdf_bytes, api_key, provider="groq", model=None, n=10):
+    """Зір дивиться перші n сторінок -> правила (recipe) для всієї книги.
+    На будь-якій помилці повертає {} (движок працює як без зору)."""
+    import json, re
+    model = model or _default_vision_model(provider)
+    try:
+        imgs = _page_images_b64(pdf_bytes, n=n)
+        if not imgs:
+            return {}
+        raw = _vision_call(provider, api_key, model, _VISION_PROMPT, imgs)
+        m = re.search(r"\{.*\}", raw, re.S)
+        rec = json.loads(m.group(0)) if m else {}
+        print("vision recipe:", rec)
+        return rec if isinstance(rec, dict) else {}
+    except Exception as e:
+        print("analyze_book failed:", e)
+        return {}
+
+
+def _rgb01(c):
+    return (c[0] / 255, c[1] / 255, c[2] / 255) if c else None

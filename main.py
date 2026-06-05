@@ -97,21 +97,30 @@ def translate_sync(file: UploadFile = File(...), api_key: str = Form(...),
 
 # ----------- ФОНОВА ЧЕРГА без Supabase (для великих книг через браузер) -----------
 def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
-                   proofread, filename):
+                   proofread, filename, vision=False, vision_model=""):
     import sys
     def log(m):
         print(f"[job {job_id}] {m}", flush=True); sys.stdout.flush()
     try:
         JOBS[job_id].update(status="processing", progress=1)
-        log(f"start: {len(pdf_bytes)//1024}KB, provider={provider}, model={model!r}, src={src}")
+        log(f"start: {len(pdf_bytes)//1024}KB, provider={provider}, model={model!r}, src={src}, vision={vision}")
 
         def cb(done, total):
             JOBS[job_id]["progress"] = max(1, min(99, int(done / max(total, 1) * 99)))
 
+        recipe = {}
+        if vision:
+            JOBS[job_id]["vision"] = "pending"
+            log("vision: analyzing first pages...")
+            recipe = P.analyze_book(pdf_bytes, api_key, provider=provider,
+                                    model=(vision_model or None))
+            JOBS[job_id]["vision"] = "ok" if recipe else "failed"
+            log(f"vision recipe: {recipe}")
+
         log("extract_blocks...")
         pages = P.extract_blocks(pdf_bytes, ocr_lang=P._LANG_OCR.get(src, "rus"))
         nb = sum(len(p) for p in pages)
-        scanned = P.looks_scanned(pages)
+        scanned = bool(recipe.get("scanned")) or P.looks_scanned(pages)
         log(f"extracted: pages={len(pages)}, blocks={nb}, scanned={scanned}")
         if scanned:
             log("scanned mode -> OCR all pages...")
@@ -126,7 +135,7 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
                                     proofread=proofread, progress_cb=cb)
             log("build_pdf...")
             tmap = {flat[i][0]: tr[i] for i in range(len(flat))}
-            out = P.build_pdf(pdf_bytes, pages, tmap)
+            out = P.build_pdf(pdf_bytes, pages, tmap, recipe=recipe)
         log(f"done: {len(out)//1024}KB")
         path = os.path.join(JOB_DIR, f"{job_id}.pdf")
         with open(path, "wb") as f:
@@ -143,14 +152,15 @@ async def create_job(background: BackgroundTasks,
                      file: UploadFile = File(...), api_key: str = Form(...),
                      provider: str = Form("gemini"), model: str = Form(""),
                      src: str = Form("ru"), dst: str = Form("uk"),
-                     proofread: bool = Form(False)):
+                     proofread: bool = Form(False),
+                     vision: bool = Form(False), vision_model: str = Form("")):
     """Запускає фонову задачу. Одразу повертає job_id (без таймауту)."""
     pdf_bytes = await file.read()
     job_id = uuid.uuid4().hex[:12]
     base = (file.filename or "book").rsplit(".", 1)[0]
     JOBS[job_id] = {"status": "queued", "progress": 0, "name": f"{base}_uk.pdf"}
     background.add_task(_run_local_job, job_id, pdf_bytes, api_key, provider,
-                        model, src, dst, proofread, file.filename)
+                        model, src, dst, proofread, file.filename, vision, vision_model)
     return JSONResponse({
         "job_id": job_id,
         "status_url": f"/jobs/{job_id}",
@@ -178,13 +188,17 @@ def job_download(job_id: str):
 def cover(file: UploadFile = File(...), api_key: str = Form(...),
           provider: str = Form("gemini"), model: str = Form(""),
           src: str = Form("ru"), dst: str = Form("uk"),
-          title: str = Form(""), author: str = Form("")):
-    """Генерує нову обкладинку у стилі оригіналу з перекладеною назвою (PNG).
-    title/author можна задати вручну; якщо порожні — беруться з обкладинки (OCR)."""
+          title: str = Form(""), author: str = Form(""),
+          vision: bool = Form(False), vision_model: str = Form("")):
+    """Генерує обкладинку з перекладеною назвою (PNG). vision=true -> зір вирішує
+    'замінити на місці' чи 'генерувати'. title/author можна задати вручну."""
     pdf_bytes = file.file.read()
     try:
+        recipe = (P.analyze_book(pdf_bytes, api_key, provider=provider,
+                                 model=(vision_model or None), n=3) if vision else {})
         png = P.make_cover(pdf_bytes, api_key, provider=provider, model=model or None,
-                           src=src, dst=dst, title=title or None, author=author or None)
+                           src=src, dst=dst, title=title or None, author=author or None,
+                           recipe=recipe)
     except Exception as e:
         raise HTTPException(500, f"cover error: {e}")
     return StreamingResponse(io.BytesIO(png), media_type="image/png",
