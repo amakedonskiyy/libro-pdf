@@ -157,14 +157,16 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
             if (pages and len(pages[0]) == 0
                     and not (recipe or {}).get("keep_original_cover")):
                 try:
-                    log("cover is image -> regenerating with translated title...")
-                    ttl = P._guess_title(pages)
+                    log("cover is image -> trying in-place title replacement...")
                     cov = P.make_cover(pdf_bytes, api_key, provider=provider,
                                        model=model or None, src=src, dst=dst,
-                                       title=ttl, author="", recipe=recipe,
-                                       glossary=glossary)
-                    out = P.replace_first_page_image(out, cov)
-                    log(f"cover regenerated (title hint={ttl!r})")
+                                       title=None, author="", recipe=recipe,
+                                       glossary=glossary, allow_generate=False)
+                    if cov:
+                        out = P.replace_first_page_image(out, cov)
+                        log("cover: title replaced in place")
+                    else:
+                        log("cover: could not replace cleanly -> kept original")
                 except Exception as ce:
                     log(f"cover skipped (kept original): {ce}")
         log(f"done: {len(out)//1024}KB")

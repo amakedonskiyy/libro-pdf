@@ -865,7 +865,7 @@ def _cover_lines(doc, ocr_lang="rus"):
 
 def make_cover(pdf_bytes, api_key, provider="gemini", model=None,
                src="ru", dst="uk", title=None, author=None, recipe=None,
-               glossary=None):
+               glossary=None, allow_generate=True):
     """Однотонний фон -> заміна назви НА МІСЦІ (оригінал лишається).
     Складний фон -> нова обкладинка у стилі оригіналу. Текст завжди наш (чіткий)."""
     from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -936,6 +936,12 @@ def make_cover(pdf_bytes, api_key, provider="gemini", model=None,
         replace_block(alines, t_author)
         out = io.BytesIO(); work.save(out, "PNG")
         return out.getvalue()
+
+    # Не вдалося замінити текст НА МІСЦІ (фон не однотонний або OCR не знайшов
+    # назву). У робочому потоці генерувати нову обкладинку НЕ хочемо
+    # (краще лишити оригінал, ніж зробити уродця) -> повертаємо None.
+    if not allow_generate:
+        return None
 
     # ============ РЕЖИМ ГЕНЕРАЦІЇ (складний фон) ============
     W = 1000
