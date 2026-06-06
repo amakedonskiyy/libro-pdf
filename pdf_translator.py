@@ -58,20 +58,29 @@ _LANG_OCR = {"ru": "rus", "uk": "ukr", "ua": "ukr", "en": "eng"}
 
 
 def _looks_garbled(text: str) -> bool:
-    """Ознака битого тексту: цифра/дужка/кома, вклеєна ВСЕРЕДИНУ слова,
-    або слово, що починається з цифри (напр. '1ГЛОР(23' = «ГЛОРИЯ»)."""
+    """Ознака битого тексту: цифра/дужка/кома, вклеєна ВСЕРЕДИНУ слова;
+    слово, що починається з цифри ('1ГЛОР(23'); або дефіс упритул до іншого
+    знака ',-' / '-.' (характерний глифовий мотлох стилізованих шрифтів)."""
     if not text:
         return False
     letters = sum(ch.isalpha() for ch in text)
     if letters < 2:
         return False
+    # дефіс упритул до коми/крапки/дужки (',-', '-.', '.-', ',)' ...) —
+    # глифовий мотлох. У нормальному тексті такого нема: телефони '703-73',
+    # слова 'як-то', роки '1990-х' мають дефіс між цифрами/літерами,
+    # а не біля іншого розділового знака.
+    if re.search(r"[\,\.\)\(]\-|\-[\,\.\)\(]", text):
+        return True
     anomalies = len(re.findall(
         r"[А-Яа-яЇїІіЄєҐґA-Za-z][\)\(\,\d][А-Яа-яЇїІіЄєҐґA-Za-z]", text))
     anomalies += len(re.findall(r"\d[А-Яа-яЇїІіЄєҐґ]{2,}", text))  # '1ГЛОР'
-    # короткий заголовок, у якому є і дужка, і цифра поряд із КИРИЛИЦЕЮ
-    # (напр. 'ЧА)9Ь 1'); латинські посилання типу '(Spoerl, 1975)' не чіпаємо
+    # короткий заголовок з дужкою+цифрою поряд із КИРИЛИЦЕЮ ('ЧА)9Ь 1');
+    # латинські посилання '(Spoerl, 1975)' й телефони/адреси (багато цифр)
+    # не чіпаємо
     if (len(text) <= 40 and re.search(r"[\)\(]", text) and re.search(r"\d", text)
-            and re.search(r"[А-Яа-яЇїІіЄєҐґ]", text)):
+            and re.search(r"[А-Яа-яЇїІіЄєҐґ]", text)
+            and sum(ch.isdigit() for ch in text) <= 4):
         return True
     return anomalies >= 2 or (anomalies >= 1 and len(text) <= 80)
 
@@ -136,11 +145,16 @@ def extract_blocks(pdf_bytes: bytes, ocr_lang: str = "rus"):
             text = text.replace("\n", " ").strip()
             if not text:
                 continue
-            # якщо текст битий — рятуємо OCR-ом по цій же ділянці
+            # якщо текст битий — рятуємо OCR-ом; не врятували -> позначимо garbled
+            # (build_pdf не чіпатиме такий блок: лишить оригінал читабельним,
+            #  а не вставить кашу типу 'я,-.тн-е 012')
+            garbled = False
             if _looks_garbled(text):
                 fixed = _ocr_region(page, b["bbox"], ocr_lang)
                 if fixed and not _looks_garbled(fixed):
                     text = fixed
+                else:
+                    garbled = True
             # домінуючий стиль = найбільший span
             main = max(spans, key=lambda s: s["size"])
             col = main.get("color", 0)
@@ -155,6 +169,7 @@ def extract_blocks(pdf_bytes: bytes, ocr_lang: str = "rus"):
                 "color": rgb,
                 "fontname": fontname,
                 "fontfile": fontfile,
+                "garbled": garbled,
             })
             gid += 1
         pages.append(blocks)
@@ -244,8 +259,11 @@ def build_glossary(texts, api_key, provider="gemini", model=None,
         out = {}
         for k, v in gl.items():
             k, v = str(k).strip(), str(v).strip()
-            if 1 < len(k) <= 60 and 0 < len(v) <= 80:
-                out[k] = v
+            if not (1 < len(k) <= 60 and 0 < len(v) <= 80):
+                continue
+            if _looks_garbled(k) or _looks_garbled(v):   # мотлох у словник не пускаємо
+                continue
+            out[k] = v
         print(f"glossary: {len(out)} термінів")
         return dict(list(out.items())[:60])
     except Exception as e:
@@ -588,7 +606,8 @@ def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
         # --- беремо лише блоки з НЕПОРОЖНІМ перекладом ---
         # (непереведені абзаци не чіпаємо: лишаємо чистий оригінал,
         #  без плашки і без подвійного тексту)
-        live = [b for b in blocks if (translations.get(b["id"]) or "").strip()]
+        live = [b for b in blocks
+                if (translations.get(b["id"]) or "").strip() and not b.get("garbled")]
         if not live:
             continue
 
@@ -845,7 +864,8 @@ def _cover_lines(doc, ocr_lang="rus"):
 
 
 def make_cover(pdf_bytes, api_key, provider="gemini", model=None,
-               src="ru", dst="uk", title=None, author=None, recipe=None):
+               src="ru", dst="uk", title=None, author=None, recipe=None,
+               glossary=None):
     """Однотонний фон -> заміна назви НА МІСЦІ (оригінал лишається).
     Складний фон -> нова обкладинка у стилі оригіналу. Текст завжди наш (чіткий)."""
     from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -860,7 +880,8 @@ def make_cover(pdf_bytes, api_key, provider="gemini", model=None,
     if author is None:
         author = alines[0]["text"] if alines else ""
     tr = translate_blocks([title] + ([author] if author else []), api_key,
-                          provider=provider, model=model, src=src, dst=dst)
+                          provider=provider, model=model, src=src, dst=dst,
+                          glossary=glossary)
     t_title = (tr[0].strip() or title)
     t_author = (tr[1].strip() if author else "")
     doc.close()

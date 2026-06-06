@@ -154,13 +154,15 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
             # Пересоберемо її з перекладеною назвою (назву беремо з тексту
             # титульної сторінки, не з OCR обкладинки). Безпечно: будь-яка
             # помилка -> лишаємо оригінальну обкладинку, задача не падає.
-            if pages and len(pages[0]) == 0:
+            if (pages and len(pages[0]) == 0
+                    and not (recipe or {}).get("keep_original_cover")):
                 try:
                     log("cover is image -> regenerating with translated title...")
                     ttl = P._guess_title(pages)
                     cov = P.make_cover(pdf_bytes, api_key, provider=provider,
                                        model=model or None, src=src, dst=dst,
-                                       title=ttl, recipe=recipe)
+                                       title=ttl, author="", recipe=recipe,
+                                       glossary=glossary)
                     out = P.replace_first_page_image(out, cov)
                     log(f"cover regenerated (title hint={ttl!r})")
                 except Exception as ce:
