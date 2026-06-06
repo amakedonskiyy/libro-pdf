@@ -413,12 +413,12 @@ def proofread_blocks(originals, drafts, api_key, provider, model, src, dst,
 
 # ---------------------------------------------------------------- 3. build
 def _place_text(page, bbox, text, fontname, fontfile, color, size,
-                col_right=None):
+                col_right=None, max_bottom=None):
     """Вставляє text у прямокутник. Тримає ОДИН розмір шрифту, переносить
-    рядки В МЕЖАХ КОЛОНКИ і за потреби нарощує висоту вниз. Шрифт зменшує
-    лише як крайній засіб (щоб слово не вилазило за край). col_right — права
-    межа колонки (щоб текст не ліз на сусідів і не вилазив за поле сторінки).
-    Повертає True, якщо вмістив."""
+    рядки В МЕЖАХ КОЛОНКИ і за потреби нарощує висоту вниз (але не нижче
+    max_bottom — верху наступного блоку, щоб не налазити). Шрифт зменшує лише
+    як крайній засіб. col_right — права межа колонки (щоб текст не ліз на
+    сусідів і не вилазив за поле сторінки). Повертає True, якщо вмістив."""
     x0, y0, x1, y1 = bbox
     page_r = page.rect
     margin = 2.0
@@ -427,7 +427,10 @@ def _place_text(page, bbox, text, fontname, fontfile, color, size,
     right = min(col_right if col_right else x1, page_r.x1 - margin)
     if right <= left + 20:                      # дуже вузький блок — дамо мінімум
         right = min(left + 130, page_r.x1 - margin)
+    # низ: не нижче за верх наступного блоку (щоб не налазити), і не за сторінку
     bottom_cap = page_r.y1 - margin
+    if max_bottom is not None:
+        bottom_cap = min(bottom_cap, max(y1 + 2, max_bottom))
     min_sz = max(6.0, size * 0.7)               # не дрібнимо більш ніж на 30%
     # 1) тримаємо розмір, нарощуємо висоту вниз; 2) лише потім трохи зменшуємо
     sz = float(size)
@@ -517,7 +520,6 @@ def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
         except statistics.StatisticsError:
             body = round(statistics.median(sizes))
         body = max(6, min(int(body), 16))
-        heading_cut = body * 1.5                # помітно більший блок = заголовок
 
         # --- рендеримо сторінку (раз) для підбору кольору фону ---
         # ЗАВЖДИ (не лише за наявності картинок): так кремові/пергаментні
@@ -551,13 +553,28 @@ def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
         # текст видаляємо (default), зображення НЕ чіпаємо
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
-        # 3b. Вставляємо переклад: основний текст — рівним розміром body,
-        #     заголовки лишають свій (більший) розмір. Усе зажате по ширині блоку.
+        # верх найближчого блоку нижче (по колонці) — щоб переклад не налазив униз
+        def floor_for(bb):
+            bx0, byt, bx1 = bb["bbox"][0], bb["bbox"][1], bb["bbox"][2]
+            f = page_r.y1 - 2
+            for o in live:
+                if o is bb:
+                    continue
+                ox0, oy0, ox1, _ = o["bbox"]
+                if oy0 > byt + 2 and ox1 > bx0 and ox0 < bx1:
+                    f = min(f, oy0 - 2)
+            return f
+
+        # 3b. Вставляємо переклад: основний текст — рівним розміром body.
+        #     Заголовком вважаємо ЛИШЕ короткий і помітно більший блок
+        #     (щоб великий абзац не роздувався), і обмежуємо його розмір.
         for b in live:
             tgt = translations.get(b["id"])
-            place_sz = b["size"] if b["size"] >= heading_cut else body
+            is_head = (b["size"] >= body * 1.4 and len(tgt.strip()) <= 55)
+            place_sz = min(b["size"], body * 2.2) if is_head else body
             _place_text(page, b["bbox"], tgt, b["fontname"], b["fontfile"],
-                        b["color"], place_sz, col_right=b["bbox"][2])
+                        b["color"], place_sz, col_right=b["bbox"][2],
+                        max_bottom=floor_for(b))
 
     out = io.BytesIO()
     doc.save(out, garbage=4, deflate=True)      # стиснення + дедуп шрифтів
@@ -665,7 +682,11 @@ def translate_scanned_pdf(pdf_bytes, api_key, provider="gemini", model=None,
                            fill=(bg[0] / 255, bg[1] / 255, bg[2] / 255))
             # колір тексту під фон: темний фон → білий текст, світлий → темний
             tc = (1, 1, 1) if _lum(bg) < 130 else (0.1, 0.1, 0.1)
-            grow = fitz.Rect(x0, y0, x1 + (x1 - x0) * 0.8, y1 + (y1 - y0) * 1.3)
+            # рамка для перекладу: дозволяємо трохи ширше за оригінальний рядок,
+            # але НІКОЛИ не за праве поле сторінки (інакше текст вилазить за край)
+            page_w = newp.rect.width
+            right = min(x1 + (x1 - x0) * 0.8, page_w - 2)
+            grow = fitz.Rect(x0, y0, right, y1 + (y1 - y0) * 1.3)
             size = max(6.0, (y1 - y0) * 0.85)
             for _ in range(7):
                 rc = newp.insert_textbox(grow, uk, fontfile=fontfile, fontname="ocr",

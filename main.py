@@ -120,7 +120,14 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
         log("extract_blocks...")
         pages = P.extract_blocks(pdf_bytes, ocr_lang=P._LANG_OCR.get(src, "rus"))
         nb = sum(len(p) for p in pages)
-        scanned = bool(recipe.get("scanned")) or P.looks_scanned(pages)
+        # Маршрут (скан чи текст) вирішуємо за РЕАЛЬНИМ текстовим шаром.
+        # Зір часто помилково каже "скан" для звичайних текстових книг —
+        # тому його підказку беремо лише коли тексту майже немає (справжній скан).
+        scanned = P.looks_scanned(pages)
+        if not scanned and recipe.get("scanned"):
+            nchars = sum(len(b["text"]) for p in pages for b in p)
+            if nchars < 60 * max(len(pages), 1):
+                scanned = True
         log(f"extracted: pages={len(pages)}, blocks={nb}, scanned={scanned}")
         if scanned:
             log("scanned mode -> OCR all pages...")
