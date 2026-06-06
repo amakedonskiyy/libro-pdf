@@ -64,11 +64,11 @@ def _looks_garbled(text: str) -> bool:
     if not text:
         return False
     letters = sum(ch.isalpha() for ch in text)
-    # суцільні цифри без жодної літери (4+) — найчастіше глифовий мотлох
-    # стилізованого заголовка ('34567' замість 'ЯРОСТНОЕ НЛП'). Номери
-    # сторінок (1-3 цифри) і короткі числа не чіпаємо. OCR-рятунок потім
-    # або прочитає справжній заголовок, або блок лишиться оригіналом.
-    if letters == 0 and sum(ch.isdigit() for ch in text) >= 4:
+    # 4+ цифр і майже без літер (<=1) — глифовий мотлох стилізованого заголовка
+    # ('34567' / '34567 I' замість 'ЧАСТЬ' / 'ЯРОСТНОЕ НЛП'). Номери сторінок
+    # (1-3 цифри) і короткі числа не чіпаємо. OCR-рятунок потім або прочитає
+    # справжнє слово, або блок лишиться читабельним оригіналом.
+    if sum(ch.isdigit() for ch in text) >= 4 and letters <= 1:
         return True
     if letters < 2:
         return False
@@ -614,7 +614,9 @@ def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
         # (непереведені абзаци не чіпаємо: лишаємо чистий оригінал,
         #  без плашки і без подвійного тексту)
         live = [b for b in blocks
-                if (translations.get(b["id"]) or "").strip() and not b.get("garbled")]
+                if (translations.get(b["id"]) or "").strip()
+                and not b.get("garbled")
+                and not _looks_garbled(translations.get(b["id"]) or "")]
         if not live:
             continue
 

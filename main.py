@@ -71,10 +71,14 @@ def supa_upload_result(path, pdf_bytes):
     return SUPA_URL + "/storage/v1" + r.json()["signedURL"]
 
 
+ENGINE_VERSION = "2026-06-06-guard34567-v2"
+
+
 # ---------------------------------------------------------------- endpoints
 @app.get("/health")
 def health():
-    return {"ok": True, "supabase_configured": bool(SUPA_URL and SUPA_KEY)}
+    return {"ok": True, "version": ENGINE_VERSION,
+            "supabase_configured": bool(SUPA_URL and SUPA_KEY)}
 
 
 @app.post("/translate-pdf-sync")
@@ -103,7 +107,7 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
         print(f"[job {job_id}] {m}", flush=True); sys.stdout.flush()
     try:
         JOBS[job_id].update(status="processing", progress=1)
-        log(f"start: {len(pdf_bytes)//1024}KB, provider={provider}, model={model!r}, src={src}, vision={vision}")
+        log(f"start [{ENGINE_VERSION}]: {len(pdf_bytes)//1024}KB, provider={provider}, model={model!r}, src={src}, vision={vision}")
 
         def cb(done, total):
             JOBS[job_id]["progress"] = max(1, min(99, int(done / max(total, 1) * 99)))
