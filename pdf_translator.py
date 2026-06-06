@@ -208,6 +208,50 @@ _EDITOR_PROMPT = (
 
 _LANG = {"ru": "російської", "en": "англійської", "uk": "українську", "ua": "українську"}
 
+_GLOSSARY_SYS = (
+    "Ти — термінолог. Тобі дають фрагменти книги мовою {src}. Вибери до 40 "
+    "КЛЮЧОВИХ повторюваних термінів, фахового жаргону та власних назв, що мають "
+    "перекладатися ОДНАКОВО по всій книзі (НЕ загальновживані слова). Для кожного "
+    "дай канонічний переклад на {dst}. Поверни ЛИШЕ JSON-обʼєкт виду "
+    '{{"термін": "переклад"}} — без пояснень, без markdown, без ```.'
+)
+
+
+def build_glossary(texts, api_key, provider="gemini", model=None,
+                   src="ru", dst="uk", sample_chars=8000):
+    """Один LLM-прохід: витягує повторювані терміни/власні назви з рівномірної
+    вибірки книги і дає канонічний переклад. Повертає {термін: переклад}.
+    Будь-яка помилка -> порожній словник (переклад працює і без глосарію)."""
+    try:
+        model = model or _default_model(provider)
+        joined, step, total = [], max(1, len(texts) // 120), 0
+        for i in range(0, len(texts), step):
+            t = (texts[i] or "").strip()
+            if len(t) < 12:
+                continue
+            joined.append(t)
+            total += len(t)
+            if total >= sample_chars:
+                break
+        if not joined:
+            return {}
+        sys = _GLOSSARY_SYS.format(src=_LANG.get(src, src), dst=_LANG.get(dst, dst))
+        raw = _llm_call(provider, api_key, model, sys, "\n".join(joined))
+        m = re.search(r"\{.*\}", raw, re.S)
+        gl = json.loads(m.group(0)) if m else {}
+        if not isinstance(gl, dict):
+            return {}
+        out = {}
+        for k, v in gl.items():
+            k, v = str(k).strip(), str(v).strip()
+            if 1 < len(k) <= 60 and 0 < len(v) <= 80:
+                out[k] = v
+        print(f"glossary: {len(out)} термінів")
+        return dict(list(out.items())[:60])
+    except Exception as e:
+        print("build_glossary failed:", e)
+        return {}
+
 
 def _groq_call(api_key, model, system, user, timeout=120, max_retries=5):
     """Виклик Groq. 429/5xx — терплячий повтор; 4xx (погана модель/ключ) — одразу падаємо."""
@@ -313,14 +357,19 @@ def _make_batches(items_len, length_of, char_budget):
 
 def translate_blocks(texts, api_key, provider="gemini", model=None,
                      src="ru", dst="uk", char_budget=2500, proofread=False,
-                     progress_cb=None):
+                     progress_cb=None, glossary=None):
     """
     Перекладає список рядків. Батчить, перевіряє кількість сегментів,
     fallback по одному. Якщо proofread=True — другий прохід-редактор.
+    glossary={термін:переклад} — для єдиної термінології по всій книзі.
     Прогрес рахується на обидві фази (переклад + редактор).
     """
     model = model or _default_model(provider)
     system = _SYS_PROMPT.format(src=_LANG.get(src, src), dst=_LANG.get(dst, dst))
+    if glossary:
+        gl = "; ".join(f"{k} → {v}" for k, v in glossary.items())
+        system += ("\n9. ОБОВ'ЯЗКОВИЙ ГЛОСАРІЙ. Уживай САМЕ ці переклади термінів "
+                   "усюди, де вони трапляються (відмінюй за контекстом): " + gl)
     out = [None] * len(texts)
     total = len(texts)
     phases = 2 if proofread else 1
@@ -365,14 +414,18 @@ def translate_blocks(texts, api_key, provider="gemini", model=None,
 
     if proofread:
         out = proofread_blocks(texts, out, api_key, provider, model, src, dst,
-                               char_budget=char_budget, on_done=report)
+                               char_budget=char_budget, on_done=report,
+                               glossary=glossary)
     return out
 
 
 def proofread_blocks(originals, drafts, api_key, provider, model, src, dst,
-                     char_budget=2500, on_done=None):
+                     char_budget=2500, on_done=None, glossary=None):
     """Другий прохід: редактор виправляє чернетку, звіряючи з оригіналом."""
     system = _EDITOR_PROMPT.format(src=_LANG.get(src, src), dst=_LANG.get(dst, dst))
+    if glossary:
+        gl = "; ".join(f"{k} → {v}" for k, v in glossary.items())
+        system += ("\nДотримуйся глосарію (саме ці переклади термінів): " + gl)
     out = list(drafts)
     n = len(drafts)
 
@@ -475,15 +528,42 @@ def _sample_bg(img, x0, y0, x1, y1, pad=14):
     return (min(255, best[0] + 6), min(255, best[1] + 6), min(255, best[2] + 6))
 
 
-def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
-              keep_image_bg=True, recipe=None):
-    """
-    pdf_bytes      — оригінальний PDF.
-    pages_blocks   — результат extract_blocks().
-    translations   — {block_id: "переклад"}.
-    recipe         — правила від зору (напр. {"uniform_bg":true,"page_bg":[245,240,225]}).
-    Повертає bytes готового PDF.
-    """
+# DejaVu через @font-face -> чітка кирилиця у потрібній гарнітурі (serif/sans,
+# bold/italic). Кешуємо архів і CSS. Якщо шрифтів нема — (None, "") і build_pdf
+# падає на вбудовані serif/sans-serif.
+_FONT_ASSETS = "init"
+
+
+def _font_assets():
+    global _FONT_ASSETS
+    if _FONT_ASSETS != "init":
+        return _FONT_ASSETS
+    try:
+        import os
+        d = "/usr/share/fonts/truetype/dejavu"
+        files = [
+            ("BookSerif", "normal", "normal", "DejaVuSerif.ttf"),
+            ("BookSerif", "bold",   "normal", "DejaVuSerif-Bold.ttf"),
+            ("BookSerif", "normal", "italic", "DejaVuSerif-Italic.ttf"),
+            ("BookSerif", "bold",   "italic", "DejaVuSerif-BoldItalic.ttf"),
+            ("BookSans",  "normal", "normal", "DejaVuSans.ttf"),
+            ("BookSans",  "bold",   "normal", "DejaVuSans-Bold.ttf"),
+            ("BookSans",  "normal", "italic", "DejaVuSans-Oblique.ttf"),
+            ("BookSans",  "bold",   "italic", "DejaVuSans-BoldOblique.ttf"),
+        ]
+        css, found = [], False
+        for fam, w, s, fn in files:
+            if not os.path.exists(os.path.join(d, fn)):
+                continue
+            css.append("@font-face{font-family:'%s';src:url('%s');"
+                       "font-weight:%s;font-style:%s;}" % (fam, fn, w, s))
+            found = True
+        _FONT_ASSETS = (fitz.Archive(d), "".join(css)) if found else (None, "")
+    except Exception:
+        _FONT_ASSETS = (None, "")
+    return _FONT_ASSETS
+
+
 def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
               keep_image_bg=True, recipe=None):
     """
@@ -565,16 +645,48 @@ def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
                     f = min(f, oy0 - 2)
             return f
 
-        # 3b. Вставляємо переклад: основний текст — рівним розміром body.
-        #     Заголовком вважаємо ЛИШЕ короткий і помітно більший блок
-        #     (щоб великий абзац не роздувався), і обмежуємо його розмір.
+        # 3b. Вставляємо переклад через insert_htmlbox — ОФІЦІЙНИЙ метод PyMuPDF
+        #     для цієї задачі: сам підбирає шрифт (зокрема для неперекладених
+        #     шматків) і САМ зменшує текст, якщо не влазить. Розмір тримаємо
+        #     рівним (body), заголовок — більший; рамку зажимаємо по ширині й до
+        #     верху наступного блоку (щоб не вилазило за край і не налазило вниз).
+        import html as _html
+        _arch, _face_css = _font_assets()
         for b in live:
             tgt = translations.get(b["id"])
             is_head = (b["size"] >= body * 1.4 and len(tgt.strip()) <= 55)
-            place_sz = min(b["size"], body * 2.2) if is_head else body
-            _place_text(page, b["bbox"], tgt, b["fontname"], b["fontfile"],
-                        b["color"], place_sz, col_right=b["bbox"][2],
-                        max_bottom=floor_for(b))
+            place_sz = min(b["size"], body * 2.2) if is_head else float(body)
+            x0, y0, x1, y1 = b["bbox"]
+            left = max(x0, 2.0)
+            right = min(x1, page_r.x1 - 2.0)
+            if right <= left + 20:
+                right = min(left + 130, page_r.x1 - 2.0)
+            bottom = floor_for(b)
+            if bottom <= y0 + 8:                      # вироджений випадок: наступний
+                bottom = min(y0 + max(y1 - y0, 12),    # блок майже впритул — дамо мінімум
+                             page_r.y1 - 2.0)
+            rect = fitz.Rect(left, y0 - 1, right, bottom)
+            ff = b["fontfile"] or ""
+            serif = "Serif" in ff
+            fam = "'BookSerif',serif" if serif else "'BookSans',sans-serif"
+            weight = "bold" if "Bold" in ff else "normal"
+            style = "italic" if ("Italic" in ff or "Oblique" in ff) else "normal"
+            r, g, bl = b["color"]
+            hexc = "#%02x%02x%02x" % (int(r * 255), int(g * 255), int(bl * 255))
+            css = (_face_css +
+                   "*{margin:0;padding:0;line-height:1.15;font-family:%s;color:%s;}"
+                   % (fam, hexc))
+            htmltxt = ('<div style="font-size:%.1fpx;font-weight:%s;font-style:%s">%s</div>'
+                       % (place_sz, weight, style, _html.escape(tgt)))
+            try:
+                if _arch is not None:
+                    page.insert_htmlbox(rect, htmltxt, css=css, archive=_arch)
+                else:
+                    page.insert_htmlbox(rect, htmltxt, css=css)
+            except Exception:
+                _place_text(page, b["bbox"], tgt, b["fontname"], b["fontfile"],
+                            b["color"], place_sz, col_right=b["bbox"][2],
+                            max_bottom=bottom)
 
     out = io.BytesIO()
     doc.save(out, garbage=4, deflate=True)      # стиснення + дедуп шрифтів
@@ -715,8 +827,13 @@ def _dominant_colors(img, k=6):
 
 
 def _cover_lines(doc, ocr_lang="rus"):
-    """OCR обкладинки -> (рядки назви, рядки автора) з координатами (в пунктах)."""
-    lines = [l for l in _ocr_lines(doc[0], ocr_lang) if 1 < len(l["text"]) < 60]
+    """OCR обкладинки -> (рядки назви, рядки автора) з координатами (в пунктах).
+    Якщо OCR недоступний/впав — повертаємо порожньо (make_cover піде в режим
+    генерації за назвою з титульної сторінки)."""
+    try:
+        lines = [l for l in _ocr_lines(doc[0], ocr_lang) if 1 < len(l["text"]) < 60]
+    except Exception:
+        return [], []
     if not lines:
         return [], []
     for l in lines:
@@ -937,3 +1054,41 @@ def analyze_book(pdf_bytes, api_key, provider="groq", model=None, n=5):
 
 def _rgb01(c):
     return (c[0] / 255, c[1] / 255, c[2] / 255) if c else None
+
+
+# ================================================================
+#                    ОБКЛАДИНКА: helpers
+# ================================================================
+def _guess_title(pages):
+    """Назва книги з ТЕКСТОВОЇ титульної сторінки (перша непорожня сторінка),
+    щоб не залежати від ненадійного OCR стилізованої обкладинки.
+    Назва = найбільші за кеглем блоки цієї сторінки (зверху вниз)."""
+    for blk in pages[:5]:
+        if not blk:
+            continue                       # обкладинка-картинка -> пропускаємо
+        mx = max(b["size"] for b in blk)
+        big = [b for b in blk if b["size"] >= mx * 0.5 and 1 < len(b["text"]) < 70]
+        if big:
+            big.sort(key=lambda b: b["bbox"][1])
+            return (" ".join(b["text"] for b in big)[:120]) or None
+        return None
+    return None
+
+
+def replace_first_page_image(pdf_bytes, png_bytes):
+    """Замінює ПЕРШУ сторінку PDF готовою картинкою обкладинки (на всю сторінку).
+    Безпечно: якщо щось не так — повертає вихідний PDF без змін."""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        if doc.page_count == 0:
+            doc.close()
+            return pdf_bytes
+        rect = doc[0].rect
+        doc.delete_page(0)
+        page = doc.new_page(pno=0, width=rect.width, height=rect.height)
+        page.insert_image(rect, stream=png_bytes)
+        out = doc.tobytes(deflate=True, garbage=4)
+        doc.close()
+        return out
+    except Exception:
+        return pdf_bytes

@@ -136,13 +136,35 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
                                           proofread=proofread, progress_cb=cb)
         else:
             flat = [(b["id"], b["text"]) for blk in pages for b in blk]
+            log("building glossary (term consistency)...")
+            glossary = P.build_glossary([t for _, t in flat], api_key,
+                                        provider=provider, model=model or None,
+                                        src=src, dst=dst)
+            log(f"glossary: {len(glossary)} terms")
             log(f"translate_blocks: {len(flat)} blocks...")
             tr = P.translate_blocks([t for _, t in flat], api_key, provider=provider,
                                     model=model or None, src=src, dst=dst,
-                                    proofread=proofread, progress_cb=cb)
+                                    proofread=proofread, progress_cb=cb,
+                                    glossary=glossary)
             log("build_pdf...")
             tmap = {flat[i][0]: tr[i] for i in range(len(flat))}
             out = P.build_pdf(pdf_bytes, pages, tmap, recipe=recipe)
+            # ОБКЛАДИНКА: якщо 1-ша сторінка — суцільна картинка (0 текстових
+            # блоків), на текстовому шляху вона лишилась би мовою оригіналу.
+            # Пересоберемо її з перекладеною назвою (назву беремо з тексту
+            # титульної сторінки, не з OCR обкладинки). Безпечно: будь-яка
+            # помилка -> лишаємо оригінальну обкладинку, задача не падає.
+            if pages and len(pages[0]) == 0:
+                try:
+                    log("cover is image -> regenerating with translated title...")
+                    ttl = P._guess_title(pages)
+                    cov = P.make_cover(pdf_bytes, api_key, provider=provider,
+                                       model=model or None, src=src, dst=dst,
+                                       title=ttl, recipe=recipe)
+                    out = P.replace_first_page_image(out, cov)
+                    log(f"cover regenerated (title hint={ttl!r})")
+                except Exception as ce:
+                    log(f"cover skipped (kept original): {ce}")
         log(f"done: {len(out)//1024}KB")
         path = os.path.join(JOB_DIR, f"{job_id}.pdf")
         with open(path, "wb") as f:
