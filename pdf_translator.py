@@ -323,7 +323,8 @@ def _gemini_call(api_key, model, system, user, timeout=120, max_retries=5):
                 json={
                     "systemInstruction": {"parts": [{"text": system}]},
                     "contents": [{"role": "user", "parts": [{"text": user}]}],
-                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192},
+                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192,
+                                         "thinkingConfig": {"thinkingBudget": 0}},
                 },
                 timeout=timeout,
             )
