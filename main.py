@@ -71,7 +71,7 @@ def supa_upload_result(path, pdf_bytes):
     return SUPA_URL + "/storage/v1" + r.json()["signedURL"]
 
 
-ENGINE_VERSION = "2026-06-06-guard34567-v2"
+ENGINE_VERSION = "2026-06-10-cover-vision-v1"
 
 
 # ---------------------------------------------------------------- endpoints
@@ -101,13 +101,14 @@ def translate_sync(file: UploadFile = File(...), api_key: str = Form(...),
 
 # ----------- ФОНОВА ЧЕРГА без Supabase (для великих книг через браузер) -----------
 def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
-                   proofread, filename, vision=False, vision_model=""):
+                   proofread, filename, vision=False, vision_model="",
+                   cover_vision=False):
     import sys
     def log(m):
         print(f"[job {job_id}] {m}", flush=True); sys.stdout.flush()
     try:
         JOBS[job_id].update(status="processing", progress=1)
-        log(f"start [{ENGINE_VERSION}]: {len(pdf_bytes)//1024}KB, provider={provider}, model={model!r}, src={src}, vision={vision}")
+        log(f"start [{ENGINE_VERSION}]: {len(pdf_bytes)//1024}KB, provider={provider}, model={model!r}, src={src}, vision={vision}, cover_vision={cover_vision}")
 
         def cb(done, total):
             JOBS[job_id]["progress"] = max(1, min(99, int(done / max(total, 1) * 99)))
@@ -160,19 +161,39 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
             # помилка -> лишаємо оригінальну обкладинку, задача не падає.
             if (pages and len(pages[0]) == 0
                     and not (recipe or {}).get("keep_original_cover")):
-                try:
-                    log("cover is image -> trying in-place title replacement...")
-                    cov = P.make_cover(pdf_bytes, api_key, provider=provider,
-                                       model=model or None, src=src, dst=dst,
-                                       title=None, author="", recipe=recipe,
-                                       glossary=glossary, allow_generate=False)
-                    if cov:
-                        out = P.replace_first_page_image(out, cov)
-                        log("cover: title replaced in place")
-                    else:
-                        log("cover: could not replace cleanly -> kept original")
-                except Exception as ce:
-                    log(f"cover skipped (kept original): {ce}")
+                cov = None
+                # Ланцюжок обкладинки: vision (за прапорцем) -> OCR-на-місці ->
+                # оригінал. Будь-яка помилка кроку = перехід до наступного,
+                # задача НЕ падає (правило 6).
+                if cover_vision and provider == "gemini":
+                    try:
+                        log("cover: vision mode (read -> translate -> redraw)...")
+                        png = P.render_cover_png(pdf_bytes)
+                        cov = P.translate_cover_vision(png, api_key,
+                                                       glossary=glossary,
+                                                       src=src, dst=dst,
+                                                       model=model or None)
+                        log("cover: vision OK")
+                    except Exception as ce:
+                        cov = None
+                        log(f"cover vision failed -> OCR fallback: {ce}")
+                elif cover_vision:
+                    log("cover_vision підтримує лише provider=gemini -> OCR fallback")
+                if cov is None:
+                    try:
+                        log("cover is image -> trying in-place title replacement...")
+                        cov = P.make_cover(pdf_bytes, api_key, provider=provider,
+                                           model=model or None, src=src, dst=dst,
+                                           title=None, author="", recipe=recipe,
+                                           glossary=glossary, allow_generate=False)
+                    except Exception as ce:
+                        cov = None
+                        log(f"cover skipped (kept original): {ce}")
+                if cov:
+                    out = P.replace_first_page_image(out, cov)
+                    log("cover: replaced")
+                else:
+                    log("cover: could not replace cleanly -> kept original")
         log(f"done: {len(out)//1024}KB")
         path = os.path.join(JOB_DIR, f"{job_id}.pdf")
         with open(path, "wb") as f:
@@ -190,14 +211,18 @@ async def create_job(background: BackgroundTasks,
                      provider: str = Form("gemini"), model: str = Form(""),
                      src: str = Form("ru"), dst: str = Form("uk"),
                      proofread: bool = Form(False),
-                     vision: bool = Form(False), vision_model: str = Form("")):
-    """Запускає фонову задачу. Одразу повертає job_id (без таймауту)."""
+                     vision: bool = Form(False), vision_model: str = Form(""),
+                     cover_vision: bool = Form(False)):
+    """Запускає фонову задачу. Одразу повертає job_id (без таймауту).
+    cover_vision=true -> обкладинку читає зір (Gemini) і перемальовує;
+    за замовчуванням false (увімкнемо після калібрування)."""
     pdf_bytes = await file.read()
     job_id = uuid.uuid4().hex[:12]
     base = (file.filename or "book").rsplit(".", 1)[0]
     JOBS[job_id] = {"status": "queued", "progress": 0, "name": f"{base}_uk.pdf"}
     background.add_task(_run_local_job, job_id, pdf_bytes, api_key, provider,
-                        model, src, dst, proofread, file.filename, vision, vision_model)
+                        model, src, dst, proofread, file.filename, vision,
+                        vision_model, cover_vision)
     return JSONResponse({
         "job_id": job_id,
         "status_url": f"/jobs/{job_id}",

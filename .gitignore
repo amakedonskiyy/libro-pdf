@@ -1,0 +1,24 @@
+# --- Test books / large binaries (НЕ коммитить: bengalskii ~104 МБ > лимита GitHub 100 МБ) ---
+books/
+
+# --- Secrets ---
+.env
+.env.*
+
+# --- Python venv / caches ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# --- Test outputs (обложки/прогоны не коммитятся) ---
+tests/out_*
+tests/sample_*.pdf
+
+# --- Локальные DejaVu TTF для мака (на проде шрифты ставит Dockerfile) ---
+.fonts/
+
+# --- OS ---
+.DS_Store

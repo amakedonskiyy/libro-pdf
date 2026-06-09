@@ -24,7 +24,19 @@ import fitz  # PyMuPDF
 
 # ---------------------------------------------------------------- шрифти
 # DejaVu має повну кирилицю. Підбираємо варіант під стиль оригіналу.
-_FONT_DIR = "/usr/share/fonts/truetype/dejavu"
+# Каталог шукаємо: $LIBRO_FONT_DIR -> системний (Railway/Linux, як і раніше) ->
+# локальний .fonts/dejavu у репозиторії (мак-розробка без brew/apt).
+def _resolve_font_dir():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in (os.environ.get("LIBRO_FONT_DIR", ""),
+              "/usr/share/fonts/truetype/dejavu",
+              os.path.join(here, ".fonts", "dejavu")):
+        if d and os.path.exists(os.path.join(d, "DejaVuSans.ttf")):
+            return d
+    return "/usr/share/fonts/truetype/dejavu"
+
+
+_FONT_DIR = _resolve_font_dir()
 _FONTS = {
     ("sans", False, False): f"{_FONT_DIR}/DejaVuSans.ttf",
     ("sans", True,  False): f"{_FONT_DIR}/DejaVuSans-Bold.ttf",
@@ -35,8 +47,6 @@ _FONTS = {
     ("serif", False, True):  f"{_FONT_DIR}/DejaVuSerif-Italic.ttf",
     ("serif", True,  True):  f"{_FONT_DIR}/DejaVuSerif-BoldItalic.ttf",
 }
-# дозволяємо перевизначити каталог шрифтів (напр. покласти свій TTF у проект)
-_FONT_DIR = os.environ.get("LIBRO_FONT_DIR", _FONT_DIR)
 
 
 def _pick_font(flags: int, size: float):
@@ -565,7 +575,7 @@ def _font_assets():
         return _FONT_ASSETS
     try:
         import os
-        d = "/usr/share/fonts/truetype/dejavu"
+        d = _FONT_DIR
         files = [
             ("BookSerif", "normal", "normal", "DejaVuSerif.ttf"),
             ("BookSerif", "bold",   "normal", "DejaVuSerif-Bold.ttf"),
@@ -1034,16 +1044,21 @@ def _page_images_b64(pdf_bytes, n=5, width=560):
     return out
 
 
-def _vision_call(provider, api_key, model, prompt, images_b64, timeout=120):
+def _vision_call(provider, api_key, model, prompt, images_b64, timeout=120,
+                 mime="image/jpeg", gen_config=None):
     if provider == "gemini":
-        parts = [{"text": prompt}] + [{"inline_data": {"mime_type": "image/jpeg", "data": b}}
+        # thinkingBudget:0 обов'язковий для gemini-2.5-flash (правило 9):
+        # без нього модель «думає» і обрізає відповідь.
+        cfg = gen_config or {"temperature": 0.1, "maxOutputTokens": 1024,
+                             "thinkingConfig": {"thinkingBudget": 0}}
+        parts = [{"text": prompt}] + [{"inline_data": {"mime_type": mime, "data": b}}
                                       for b in images_b64]
         r = requests.post(
             f"{_GEMINI_BASE}/{model}:generateContent",
             params={"key": api_key},
             headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
             json={"contents": [{"role": "user", "parts": parts}],
-                  "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1024}},
+                  "generationConfig": cfg},
             timeout=timeout)
         if r.status_code >= 400:
             raise _ClientError(f"Gemini vision {r.status_code}: {r.text[:300]}")
@@ -1051,7 +1066,7 @@ def _vision_call(provider, api_key, model, prompt, images_b64, timeout=120):
         return "".join(p.get("text", "") for p in cands[0]["content"]["parts"]) if cands else ""
     # groq / openai-сумісний
     content = [{"type": "text", "text": prompt}] + [
-        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b}"}}
+        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b}"}}
         for b in images_b64]
     r = requests.post(
         _GROQ_URL,
@@ -1128,3 +1143,250 @@ def replace_first_page_image(pdf_bytes, png_bytes):
         return out
     except Exception:
         return pdf_bytes
+
+
+# ================================================================
+#     ОБКЛАДИНКА ЧЕРЕЗ ЗІР: читання -> переклад -> перемальовка
+# ================================================================
+# Контракт: будь-яка помилка на будь-якому кроці -> виняток НАГОРУ.
+# Виклика́ч (main.py) ловить його і лишає оригінальну обкладинку
+# (правило 6: результат гірший за оригінал недопустимий).
+
+_COVER_VISION_PROMPT = (
+    "You read the text printed on a book cover image.\n"
+    "Return STRICTLY a JSON array, nothing else — no prose, no markdown fences:\n"
+    '[{"text": str, "bbox_pct": [x, y, w, h], "color": "#RRGGBB", '
+    '"role": "title"|"subtitle"|"author"|"other"}]\n'
+    "Rules:\n"
+    "- One element per LOGICAL text block (title, subtitle, author, series, "
+    "publisher tagline...). Reading order: top to bottom.\n"
+    "- If one logical text spans several lines (e.g. a multi-line title), it is "
+    "ONE element: join the lines with spaces, bbox covers ALL its lines.\n"
+    "- bbox_pct = [left, top, width, height] as PERCENTAGES (0-100) of the image "
+    "dimensions, covering the FULL painted text including every letter edge.\n"
+    "- color = colour of the LETTERS themselves (not the background), hex #RRGGBB.\n"
+    "- Do NOT include page numbers, barcodes, logos without words, or decorative "
+    "single letters.\n"
+    "- If the cover has no readable text, return []."
+)
+
+
+def render_cover_png(pdf_bytes, scale=2.0):
+    """ПЕРША сторінка PDF як PNG (для translate_cover_vision)."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        if doc.page_count == 0:
+            raise ValueError("порожній PDF")
+        pix = doc[0].get_pixmap(matrix=fitz.Matrix(scale, scale))
+        return pix.tobytes("png")
+    finally:
+        doc.close()
+
+
+def _hex_to_rgb(h):
+    h = str(h or "").strip().lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", h):
+        raise ValueError(f"зір повернув поганий колір: {h!r}")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _frame_mean(img, x0, y0, x1, y1, fr=5):
+    """Середній колір рамки завширшки fr px НАВКОЛО боксу (заливка під текст)."""
+    from PIL import ImageStat
+    W, H = img.size
+    bands = [(x0 - fr, y0 - fr, x1 + fr, y0), (x0 - fr, y1, x1 + fr, y1 + fr),
+             (x0 - fr, y0, x0, y1), (x1, y0, x1 + fr, y1)]
+    tot, n = [0.0, 0.0, 0.0], 0
+    for bx0, by0, bx1, by1 in bands:
+        bx0, by0 = max(0, int(bx0)), max(0, int(by0))
+        bx1, by1 = min(W, int(bx1)), min(H, int(by1))
+        if bx1 <= bx0 or by1 <= by0:
+            continue
+        st = ImageStat.Stat(img.crop((bx0, by0, bx1, by1)).convert("RGB"))
+        cnt = (bx1 - bx0) * (by1 - by0)
+        for i in range(3):
+            tot[i] += st.mean[i] * cnt
+        n += cnt
+    if not n:
+        raise ValueError("bbox поза межами картинки")
+    return tuple(int(t / n) for t in tot)
+
+
+def _refine_bbox(img, x0, y0, x1, y1, text_rgb):
+    """Зір дає РАМКИ ПРИБЛИЗНО (часто вужчі за текст -> лишаються «хвости»
+    оригінальних літер). Уточнюємо рамку по самій картинці: в околиці шукаємо
+    пікселі кольору літер (зір віддає і його) і беремо їх щільний bbox.
+    Сумнівний результат -> повертаємо рамку зору як була."""
+    from PIL import Image, ImageChops
+    W, H = img.size
+    bw, bh = x1 - x0, y1 - y0
+    mx, my = max(6.0, bw * 0.50), max(6.0, bh * 0.35)
+    sx0, sy0 = max(0, int(x0 - mx)), max(0, int(y0 - my))
+    sx1, sy1 = min(W, int(x1 + mx)), min(H, int(y1 + my))
+    if sx1 - sx0 < 4 or sy1 - sy0 < 4:
+        return x0, y0, x1, y1
+    crop = img.crop((sx0, sy0, sx1, sy1)).convert("RGB")
+    diff = ImageChops.difference(crop, Image.new("RGB", crop.size, tuple(text_rgb)))
+    mask = diff.convert("L").point(lambda v: 255 if v <= 48 else 0)
+    mb = mask.getbbox()
+    if not mb:
+        return x0, y0, x1, y1
+    npx = sum(1 for v in mask.getdata() if v)
+    rx0, ry0, rx1, ry1 = sx0 + mb[0], sy0 + mb[1], sx0 + mb[2], sy0 + mb[3]
+    # здоровий глузд: знайдене мусить перетинати рамку зору, бути не точковим
+    # шумом і не роздуватися безмежно (літери кольору фону тощо)
+    if (npx < 25
+            or rx1 <= x0 or rx0 >= x1 or ry1 <= y0 or ry0 >= y1
+            or (rx1 - rx0) * (ry1 - ry0) > 4.0 * max(bw * bh, 1.0)):
+        return x0, y0, x1, y1
+    return float(rx0), float(ry0), float(rx1), float(ry1)
+
+
+def _wrap_by_width(font, text, max_w):
+    """Жадібне перенесення слів за РЕАЛЬНОЮ шириною у пікселях."""
+    lines, cur = [], ""
+    for w in text.split():
+        t = (cur + " " + w).strip()
+        if not cur or font.getlength(t) <= max_w:
+            cur = t
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _fit_cover_font(text, box_w, box_h, fontfile, min_size=12):
+    """Підбирає кегль, щоб текст уліз у бокс за шириною (і висотою з невеликим
+    допуском). Повертає (font, lines, size). На мінімумі повертає як є —
+    краще трохи тісно, ніж зовсім без тексту."""
+    from PIL import ImageFont
+    size = max(min_size, int(box_h))
+    while size >= min_size:
+        f = ImageFont.truetype(fontfile, size)
+        lines = _wrap_by_width(f, text, box_w)
+        if (all(f.getlength(l) <= box_w for l in lines)
+                and len(lines) * size * 1.15 <= box_h * 1.25):
+            return f, lines, size
+        size -= 2
+    f = ImageFont.truetype(fontfile, min_size)
+    return f, _wrap_by_width(f, text, box_w), min_size
+
+
+def _parse_cover_json(raw):
+    """Строгий розбір відповіді зору: чистимо ```-огорожі, шукаємо JSON-масив,
+    валідуємо кожен елемент. Сміття -> ValueError (нагору)."""
+    s = (raw or "").strip()
+    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s)
+    m = re.search(r"\[.*\]", s, re.S)
+    if not m:
+        raise ValueError(f"зір не повернув JSON-масив: {s[:200]!r}")
+    items = json.loads(m.group(0))
+    if not isinstance(items, list):
+        raise ValueError("зір повернув не масив")
+    blocks = []
+    for it in items:
+        if not isinstance(it, dict):
+            raise ValueError(f"елемент не обʼєкт: {it!r}")
+        text = str(it.get("text", "")).strip()
+        if len(text) < 2:                      # лого-літери/сміття пропускаємо
+            continue
+        bb = it.get("bbox_pct")
+        if (not isinstance(bb, (list, tuple)) or len(bb) != 4
+                or not all(isinstance(v, (int, float)) for v in bb)):
+            raise ValueError(f"поганий bbox_pct: {bb!r}")
+        x, y, w, h = (float(v) for v in bb)
+        if not (0 <= x < 100 and 0 <= y < 100 and w > 0 and h > 0):
+            raise ValueError(f"bbox_pct поза межами: {bb!r}")
+        w = min(w, 100 - x)
+        h = min(h, 100 - y)
+        role = str(it.get("role", "other")).lower()
+        if role not in ("title", "subtitle", "author", "other"):
+            role = "other"
+        blocks.append({"text": text, "bbox_pct": (x, y, w, h),
+                       "color": _hex_to_rgb(it.get("color", "#000000")),
+                       "role": role})
+    if not blocks:
+        raise ValueError("зір не знайшов тексту на обкладинці")
+    return blocks
+
+
+def translate_cover_vision(cover_png_bytes, api_key, glossary=None,
+                           src="ru", dst="uk", model=None):
+    """Зір (Gemini) читає обкладинку -> переклад тих самих блоків (з глосарієм
+    книги, якщо є) -> перемальовка Pillow: бокс заливається середнім кольором
+    рамки 5px навколо, поверх — переклад DejaVu (bold для title) кольором із
+    JSON, кегль підбирається за шириною боксу, рядки центруються по боксу.
+    Повертає PNG bytes. Будь-яка помилка -> виняток нагору (правило 6)."""
+    import base64
+    from PIL import Image, ImageDraw
+
+    model = model or "gemini-2.5-flash"
+    img = Image.open(io.BytesIO(cover_png_bytes)).convert("RGB")
+    W, H = img.size
+    if W < 10 or H < 10:
+        raise ValueError(f"замала картинка обкладинки: {W}x{H}")
+
+    # --- 1. зір: компактний JPEG (<=1200px), bbox у % працює на будь-якому масштабі
+    vimg = img
+    if max(W, H) > 1200:
+        k = 1200 / max(W, H)
+        vimg = img.resize((max(1, int(W * k)), max(1, int(H * k))))
+    buf = io.BytesIO()
+    vimg.save(buf, "JPEG", quality=88)
+    img_b64 = [base64.b64encode(buf.getvalue()).decode()]
+    cfg = {"temperature": 0.1, "maxOutputTokens": 4096,
+           "thinkingConfig": {"thinkingBudget": 0}}
+    # модель зрідка віддає синтаксично битий JSON — одна повторна спроба з
+    # нагадуванням; друга невдача -> виняток нагору (ланцюжок піде у фолбек)
+    try:
+        blocks = _parse_cover_json(_vision_call(
+            "gemini", api_key, model, _COVER_VISION_PROMPT, img_b64,
+            gen_config=cfg))
+    except ValueError:
+        blocks = _parse_cover_json(_vision_call(
+            "gemini", api_key, model,
+            _COVER_VISION_PROMPT + "\nYour previous output was NOT valid JSON. "
+            "Return ONLY the syntactically valid JSON array.",
+            img_b64, gen_config=cfg))
+
+    # --- 2. переклад тих самих блоків (той самий глосарій, що й для книги)
+    texts = [b["text"] for b in blocks]
+    tr = translate_blocks(texts, api_key, provider="gemini", model=model,
+                          src=src, dst=dst, glossary=glossary)
+    for b, t in zip(blocks, tr):
+        b["uk"] = (t or "").strip() or b["text"]
+
+    # --- 3. перемальовка: спершу ВСІ заливки, потім ВЕСЬ текст
+    #     (щоб заливка сусіднього боксу не затерла вже намальований напис)
+    work = img.copy()
+    draw = ImageDraw.Draw(work)
+    boxes = []
+    for b in blocks:
+        x, y, w, h = b["bbox_pct"]
+        x0, y0 = W * x / 100.0, H * y / 100.0
+        x1, y1 = x0 + W * w / 100.0, y0 + H * h / 100.0
+        x0, y0, x1, y1 = _refine_bbox(img, x0, y0, x1, y1, b["color"])
+        pad = max(3.0, (y1 - y0) * 0.10)          # запас: антиаліасинг країв літер
+        bg = _frame_mean(img, x0 - pad, y0 - pad, x1 + pad, y1 + pad, fr=5)
+        draw.rectangle([x0 - pad, y0 - pad, x1 + pad, y1 + pad], fill=bg)
+        boxes.append((b, x0, y0, x1, y1))
+    for b, x0, y0, x1, y1 in boxes:
+        bold = b["role"] == "title"
+        fontfile = _FONTS[("sans", bold, False)]
+        if not os.path.exists(fontfile):
+            raise RuntimeError(f"немає шрифту: {fontfile}")
+        font, lines, size = _fit_cover_font(b["uk"], x1 - x0, y1 - y0, fontfile)
+        total_h = len(lines) * size * 1.15
+        yy = y0 + max(0.0, ((y1 - y0) - total_h) / 2)
+        for ln in lines:
+            lw = font.getlength(ln)
+            draw.text((x0 + ((x1 - x0) - lw) / 2, yy), ln,
+                      font=font, fill=b["color"])
+            yy += size * 1.15
+    out = io.BytesIO()
+    work.save(out, "PNG")
+    return out.getvalue()
