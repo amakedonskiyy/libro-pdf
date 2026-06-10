@@ -15,6 +15,7 @@ api_key = ключ обраного провайдера (Gemini: AIza...  /  Gr
 """
 import os
 import io
+import re
 import uuid
 import traceback
 import requests
@@ -71,7 +72,12 @@ def supa_upload_result(path, pdf_bytes):
     return SUPA_URL + "/storage/v1" + r.json()["signedURL"]
 
 
-ENGINE_VERSION = "2026-06-10-cover-vision-v1"
+ENGINE_VERSION = "2026-06-10-cover-v2"
+
+
+def _safe_err(e, limit=200):
+    """Текст помилки для статусів/логів: ключі з URL-ів вирізаються (правило 10)."""
+    return re.sub(r"key=[A-Za-z0-9_\-\.]+", "key=***", str(e))[:limit]
 
 
 # ---------------------------------------------------------------- endpoints
@@ -167,16 +173,23 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
                 # задача НЕ падає (правило 6).
                 if cover_vision and provider == "gemini":
                     try:
-                        log("cover: vision mode (read -> translate -> redraw)...")
+                        log("cover: vision mode (read -> translate -> inpaint)...")
                         png = P.render_cover_png(pdf_bytes)
-                        cov = P.translate_cover_vision(png, api_key,
+                        res = P.translate_cover_vision(png, api_key,
                                                        glossary=glossary,
                                                        src=src, dst=dst,
                                                        model=model or None)
-                        log("cover: vision OK")
+                        cov = res["png"]
+                        # сигнал якості для кнопки на фронті; рішення за людиною
+                        JOBS[job_id]["cover_status"] = res["status"]
+                        if res["reasons"]:
+                            JOBS[job_id]["cover_reasons"] = res["reasons"][:8]
+                        log(f"cover: vision {res['status']} {res['reasons']}")
                     except Exception as ce:
                         cov = None
-                        log(f"cover vision failed -> OCR fallback: {ce}")
+                        JOBS[job_id]["cover_status"] = "failed"
+                        JOBS[job_id]["cover_reasons"] = [_safe_err(ce)]
+                        log(f"cover vision failed -> OCR fallback: {_safe_err(ce)}")
                 elif cover_vision:
                     log("cover_vision підтримує лише provider=gemini -> OCR fallback")
                 if cov is None:
@@ -188,11 +201,21 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
                                            glossary=glossary, allow_generate=False)
                     except Exception as ce:
                         cov = None
-                        log(f"cover skipped (kept original): {ce}")
-                if cov:
-                    out = P.replace_first_page_image(out, cov)
+                        log(f"cover skipped (kept original): {_safe_err(ce)}")
+                rep = P.replace_first_page_image(out, cov) if cov else None
+                if rep:
+                    out = rep
+                    # vision впав, але OCR-фолбек таки замінив обкладинку:
+                    # це "doubtful" (перевір оком), а не "failed" (= оригінал)
+                    if JOBS[job_id].get("cover_status") == "failed":
+                        JOBS[job_id]["cover_status"] = "doubtful"
+                        JOBS[job_id].setdefault("cover_reasons", []).append(
+                            "vision не спрацював; обкладинку замінено OCR-фолбеком")
                     log("cover: replaced")
                 else:
+                    # failed строго = лишилась оригінальна обкладинка
+                    if cover_vision and provider == "gemini":
+                        JOBS[job_id]["cover_status"] = "failed"
                     log("cover: could not replace cleanly -> kept original")
         log(f"done: {len(out)//1024}KB")
         path = os.path.join(JOB_DIR, f"{job_id}.pdf")
@@ -265,6 +288,33 @@ def cover(file: UploadFile = File(...), api_key: str = Form(...),
         raise HTTPException(500, f"cover error: {e}")
     return StreamingResponse(io.BytesIO(png), media_type="image/png",
                              headers={"Content-Disposition": 'attachment; filename="cover.png"'})
+
+
+@app.post("/cover/generate")
+def cover_generate(file: UploadFile = File(...), api_key: str = Form(...),
+                   provider: str = Form("gemini"), model: str = Form(""),
+                   src: str = Form("ru"), dst: str = Form("uk")):
+    """Обкладинка З НУЛЯ (чиста типографіка на палітрі оригіналу).
+    ТІЛЬКИ за явним запитом користувача — в автоматичний ланцюжок обкладинки
+    генерація НЕ вбудована (правило 6). Працює лише з Gemini (зір)."""
+    if provider != "gemini":
+        raise HTTPException(400, "cover/generate працює лише з provider=gemini")
+    pdf_bytes = file.file.read()
+    try:
+        png = P.render_cover_png(pdf_bytes)
+        blocks, _reasons = P.read_cover_blocks(png, api_key, glossary=None,
+                                               src=src, dst=dst,
+                                               model=model or None)
+        out = P.generate_cover(blocks, png, 0, 0)
+    except P._ClientError as e:
+        # 4xx від LLM (ключ/модель) — помилка користувача, без ретраїв (правило 7)
+        raise HTTPException(400, f"cover generate error: {e}")
+    except Exception as e:
+        print("cover generate error:", _safe_err(e, 500))  # повний текст — лише в лог
+        raise HTTPException(500, f"cover generate error: {type(e).__name__}")
+    return StreamingResponse(io.BytesIO(out), media_type="image/png",
+                             headers={"Content-Disposition":
+                                      'attachment; filename="cover_generated.png"'})
 
 
 @app.post("/preview")

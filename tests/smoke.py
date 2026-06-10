@@ -182,6 +182,30 @@ def check_output(out_bytes):
         fail("выход: перевод не найден в готовом PDF")
 
 
+def check_generate_cover():
+    """generate_cover — чистая функция (без сети): палитра k-means, шаблон
+    по числу элементов, PNG нужного размера. Не должна падать."""
+    from PIL import Image, ImageDraw
+    src = Image.new("RGB", (300, 450), (228, 222, 205))
+    ImageDraw.Draw(src).rectangle([0, 0, 300, 120], fill=(60, 30, 25))
+    buf = io.BytesIO()
+    src.save(buf, "PNG")
+    blocks = [
+        {"text": "Заглавие", "uk": "НАЗВА КНИГИ", "role": "title",
+         "bbox_pct": [10, 30, 80, 12], "color": "#202020"},
+        {"text": "автор", "uk": "Імʼя Автора", "role": "author",
+         "bbox_pct": [10, 10, 80, 6], "color": "#202020"},
+        {"text": "подзаголовок", "uk": "Тестовий підзаголовок книги",
+         "role": "subtitle", "bbox_pct": [10, 50, 80, 8], "color": "#202020"},
+        {"text": "серия", "uk": "Серія «Тест»", "role": "other",
+         "bbox_pct": [10, 80, 80, 5], "color": "#202020"},
+    ]
+    png = P.generate_cover(blocks, buf.getvalue(), 0, 0)
+    out = Image.open(io.BytesIO(png))
+    if out.size != (300, 450):
+        fail(f"generate_cover: размер {out.size} вместо (300, 450)")
+
+
 def main():
     check_garbled_calibration()
     make_sample()
@@ -189,6 +213,7 @@ def main():
         pdf_bytes = f.read()
     out_bytes, _ = run_pipeline(pdf_bytes)
     check_output(out_bytes)
+    check_generate_cover()
     dt = time.time() - _T0
     if dt >= 30:
         fail(f"слишком долго: {dt:.1f} c (лимит 30)")

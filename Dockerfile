@@ -1,8 +1,10 @@
 FROM python:3.11-slim
 
 # DejaVu шрифти (кирилиця для рендеру) + Tesseract OCR (рятує биті заголовки)
+# libglib2.0-0 — рантайм-залежність opencv-python-headless на slim-образі
 RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-dejavu-core fonts-dejavu-extra \
+    libglib2.0-0 \
     tesseract-ocr tesseract-ocr-rus tesseract-ocr-ukr \
     && rm -rf /var/lib/apt/lists/*
 

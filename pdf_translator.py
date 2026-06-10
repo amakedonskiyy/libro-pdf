@@ -331,9 +331,10 @@ def _gemini_call(api_key, model, system, user, timeout=120, max_retries=5):
     last_err = None
     for attempt in range(max_retries):
         try:
+            # ключ ТІЛЬКИ в заголовку: в URL він потрапляє у тексти винятків
+            # requests і далі в логи/статуси (правило 10)
             r = requests.post(
                 url,
-                params={"key": api_key},
                 headers={"Content-Type": "application/json",
                          "x-goog-api-key": api_key},
                 json={
@@ -1053,9 +1054,9 @@ def _vision_call(provider, api_key, model, prompt, images_b64, timeout=120,
                              "thinkingConfig": {"thinkingBudget": 0}}
         parts = [{"text": prompt}] + [{"inline_data": {"mime_type": mime, "data": b}}
                                       for b in images_b64]
+        # ключ ТІЛЬКИ в заголовку (не в URL) — див. коментар у _gemini_call
         r = requests.post(
             f"{_GEMINI_BASE}/{model}:generateContent",
-            params={"key": api_key},
             headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
             json={"contents": [{"role": "user", "parts": parts}],
                   "generationConfig": cfg},
@@ -1128,12 +1129,13 @@ def _guess_title(pages):
 
 def replace_first_page_image(pdf_bytes, png_bytes):
     """Замінює ПЕРШУ сторінку PDF готовою картинкою обкладинки (на всю сторінку).
-    Безпечно: якщо щось не так — повертає вихідний PDF без змін."""
+    Якщо щось не так — повертає None: виклика́ч лишає вихідний PDF і чесно
+    виставляє cover_status (не «replaced», коли заміни не було)."""
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         if doc.page_count == 0:
             doc.close()
-            return pdf_bytes
+            return None
         rect = doc[0].rect
         doc.delete_page(0)
         page = doc.new_page(pno=0, width=rect.width, height=rect.height)
@@ -1142,7 +1144,7 @@ def replace_first_page_image(pdf_bytes, png_bytes):
         doc.close()
         return out
     except Exception:
-        return pdf_bytes
+        return None
 
 
 # ================================================================
@@ -1276,6 +1278,64 @@ def _fit_cover_font(text, box_w, box_h, fontfile, min_size=12):
     return f, _wrap_by_width(f, text, box_w), min_size
 
 
+def _color_mask(region, rgb, thr=48):
+    """Маска пікселів кольору літер (зважена відстань, як у _refine_bbox).
+    region — numpy uint8 HxWx3, повертає bool HxW."""
+    import numpy as np
+    d = region.astype(np.int16) - np.array(rgb, dtype=np.int16)
+    dist = (0.299 * np.abs(d[..., 0]) + 0.587 * np.abs(d[..., 1])
+            + 0.114 * np.abs(d[..., 2]))
+    return dist <= thr
+
+
+def _mask_lines(m):
+    """Рядки тексту з маски літер: горизонтальна проєкція -> відрізки
+    [(top, bottom)]. Розриви <=2 px зливаємо, шум <3 px викидаємо."""
+    runs, start = [], None
+    rows = list(m.any(axis=1)) + [False]
+    for i, v in enumerate(rows):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            runs.append([start, i])
+            start = None
+    merged = []
+    for a, b in runs:
+        if merged and a - merged[-1][1] <= 2:
+            merged[-1][1] = b
+        else:
+            merged.append([a, b])
+    return [(a, b) for a, b in merged if b - a >= 3]
+
+
+def _layout_cover_text(text, box_w, box_h, fontfile, line_h, pitch_ratio,
+                       min_size=12):
+    """Багаторядкова розкладка перекладу в рамці так, щоб ЧОРНИЛЬНА висота
+    рядка відповідала оригіналу: line_h з маски — це cap-height (~0.73 em у
+    DejaVu), тому стартовий кегль = line_h / cap_ratio; shrink-to-fit нижче
+    однаково захищає від вилазіння за рамку. Міжрядковий інтервал — пропорція
+    оригіналу (pitch_ratio = крок/висота рядка).
+    Повертає (font, lines, size, pitch_px, fitted).
+    fitted=False -> навіть мінімальний кегль не вліз (сигнал doubtful)."""
+    from PIL import ImageFont
+    cb = ImageFont.truetype(fontfile, 100).getbbox("Н")
+    cap_ratio = max(0.5, (cb[3] - cb[1]) / 100.0)
+    size = max(min_size, int(line_h / cap_ratio))
+    while size >= min_size:
+        f = ImageFont.truetype(fontfile, size)
+        lines = _wrap_by_width(f, text, box_w)
+        block_h = size + size * pitch_ratio * (len(lines) - 1)
+        if (all(f.getlength(l) <= box_w for l in lines)
+                and block_h <= box_h * 1.3):
+            return f, lines, size, size * pitch_ratio, True
+        size -= 2
+        if size < min_size and size + 2 != min_size:
+            size = min_size      # тестуємо min_size явно, паритет не перескакує
+    f = ImageFont.truetype(fontfile, min_size)
+    return (f, _wrap_by_width(f, text, box_w), min_size,
+            min_size * pitch_ratio, False)
+
+
 def _parse_cover_json(raw):
     """Строгий розбір відповіді зору: чистимо ```-огорожі, шукаємо JSON-масив,
     валідуємо кожен елемент. Сміття -> ValueError (нагору)."""
@@ -1314,15 +1374,14 @@ def _parse_cover_json(raw):
     return blocks
 
 
-def translate_cover_vision(cover_png_bytes, api_key, glossary=None,
-                           src="ru", dst="uk", model=None):
-    """Зір (Gemini) читає обкладинку -> переклад тих самих блоків (з глосарієм
-    книги, якщо є) -> перемальовка Pillow: бокс заливається середнім кольором
-    рамки 5px навколо, поверх — переклад DejaVu (bold для title) кольором із
-    JSON, кегль підбирається за шириною боксу, рядки центруються по боксу.
-    Повертає PNG bytes. Будь-яка помилка -> виняток нагору (правило 6)."""
+def read_cover_blocks(cover_png_bytes, api_key, glossary=None,
+                      src="ru", dst="uk", model=None):
+    """Зір (Gemini) читає обкладинку + переклад блоків (з глосарієм книги,
+    якщо є). Повертає (blocks, reasons): blocks = [{text, uk, bbox_pct,
+    color, role}], reasons — сигнали якості (наприклад, битий JSON з першої
+    спроби). Будь-яка фатальна помилка -> виняток нагору."""
     import base64
-    from PIL import Image, ImageDraw
+    from PIL import Image
 
     model = model or "gemini-2.5-flash"
     img = Image.open(io.BytesIO(cover_png_bytes)).convert("RGB")
@@ -1330,7 +1389,7 @@ def translate_cover_vision(cover_png_bytes, api_key, glossary=None,
     if W < 10 or H < 10:
         raise ValueError(f"замала картинка обкладинки: {W}x{H}")
 
-    # --- 1. зір: компактний JPEG (<=1200px), bbox у % працює на будь-якому масштабі
+    # зір: компактний JPEG (<=1200px), bbox у % працює на будь-якому масштабі
     vimg = img
     if max(W, H) > 1200:
         k = 1200 / max(W, H)
@@ -1340,6 +1399,7 @@ def translate_cover_vision(cover_png_bytes, api_key, glossary=None,
     img_b64 = [base64.b64encode(buf.getvalue()).decode()]
     cfg = {"temperature": 0.1, "maxOutputTokens": 4096,
            "thinkingConfig": {"thinkingBudget": 0}}
+    reasons = []
     # модель зрідка віддає синтаксично битий JSON — одна повторна спроба з
     # нагадуванням; друга невдача -> виняток нагору (ланцюжок піде у фолбек)
     try:
@@ -1347,46 +1407,270 @@ def translate_cover_vision(cover_png_bytes, api_key, glossary=None,
             "gemini", api_key, model, _COVER_VISION_PROMPT, img_b64,
             gen_config=cfg))
     except ValueError:
+        reasons.append("зір повернув битий JSON (вдалося з 2-ї спроби)")
         blocks = _parse_cover_json(_vision_call(
             "gemini", api_key, model,
             _COVER_VISION_PROMPT + "\nYour previous output was NOT valid JSON. "
             "Return ONLY the syntactically valid JSON array.",
             img_b64, gen_config=cfg))
 
-    # --- 2. переклад тих самих блоків (той самий глосарій, що й для книги)
     texts = [b["text"] for b in blocks]
     tr = translate_blocks(texts, api_key, provider="gemini", model=model,
                           src=src, dst=dst, glossary=glossary)
     for b, t in zip(blocks, tr):
         b["uk"] = (t or "").strip() or b["text"]
+    return blocks, reasons
 
-    # --- 3. перемальовка: спершу ВСІ заливки, потім ВЕСЬ текст
-    #     (щоб заливка сусіднього боксу не затерла вже намальований напис)
-    work = img.copy()
-    draw = ImageDraw.Draw(work)
+
+def translate_cover_vision(cover_png_bytes, api_key, glossary=None,
+                           src="ru", dst="uk", model=None):
+    """Зір читає обкладинку -> переклад -> ПРИБИРАННЯ оригінальних літер через
+    inpainting (cv2.INPAINT_TELEA: фон ВІДНОВЛЮЄТЬСЯ, а не замальовується
+    прямокутником) -> поверх переклад DejaVu (bold для title) кольором
+    оригіналу; багаторядкові заголовки рендеряться багаторядково з міжрядковим
+    інтервалом оригіналу.
+    Повертає {"png": bytes, "status": "ok"|"doubtful", "reasons": [...]} —
+    сигнал для кнопки на фронті, рішення завжди за людиною.
+    Будь-яка фатальна помилка -> виняток нагору (виклика́ч ставить
+    cover_status="failed" і лишає оригінал — правило 6)."""
+    import numpy as np
+    import cv2
+    from PIL import Image, ImageDraw
+
+    blocks, reasons = read_cover_blocks(cover_png_bytes, api_key,
+                                        glossary=glossary, src=src, dst=dst,
+                                        model=model)
+    img = Image.open(io.BytesIO(cover_png_bytes)).convert("RGB")
+    W, H = img.size
+    arr = np.asarray(img, dtype=np.uint8)
+
+    # --- 1. маска літер: усередині кожного bbox пікселі кольору тексту
+    mask = np.zeros((H, W), dtype=np.uint8)
     boxes = []
     for b in blocks:
         x, y, w, h = b["bbox_pct"]
         x0, y0 = W * x / 100.0, H * y / 100.0
         x1, y1 = x0 + W * w / 100.0, y0 + H * h / 100.0
         x0, y0, x1, y1 = _refine_bbox(img, x0, y0, x1, y1, b["color"])
-        pad = max(3.0, (y1 - y0) * 0.10)          # запас: антиаліасинг країв літер
-        bg = _frame_mean(img, x0 - pad, y0 - pad, x1 + pad, y1 + pad, fr=5)
-        draw.rectangle([x0 - pad, y0 - pad, x1 + pad, y1 + pad], fill=bg)
-        boxes.append((b, x0, y0, x1, y1))
-    for b, x0, y0, x1, y1 in boxes:
+        pad = max(3.0, (y1 - y0) * 0.10)         # запас: антиаліасинг країв
+        ix0, iy0 = max(0, int(x0 - pad)), max(0, int(y0 - pad))
+        ix1, iy1 = min(W, int(x1 + pad) + 1), min(H, int(y1 + pad) + 1)
+        if ix1 <= ix0 or iy1 <= iy0:
+            raise ValueError(f"порожня рамка тексту: {b['text'][:30]!r}")
+        sub = _color_mask(arr[iy0:iy1, ix0:ix1], b["color"])
+        runs = _mask_lines(sub)
+        if float(sub.mean()) < 0.005 or not runs:
+            # колір від зору не зійшовся з літерами: затирати наосліп і малювати
+            # кеглем «на всю рамку» = знищити обкладинку. Виняток нагору ->
+            # ланцюжок піде в OCR-на-місці / оригінал (правило 6).
+            raise ValueError(f"маска літер порожня (колір зору не зійшовся "
+                             f"з літерами): {b['text'][:30]!r}")
+        region = mask[iy0:iy1, ix0:ix1]
+        region[sub] = 255
+        heights = sorted(bb - aa for aa, bb in runs)
+        line_h = heights[len(heights) // 2]
+        if len(runs) > 1:
+            pitch = (runs[-1][0] - runs[0][0]) / (len(runs) - 1)
+            pitch_ratio = min(2.0, max(1.05, pitch / max(line_h, 1)))
+        else:
+            pitch_ratio = 1.15
+        boxes.append((b, x0, y0, x1, y1, line_h, pitch_ratio))
+
+    # --- 2. сигнал: уточнені рамки не мають перетинатися
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            _, ax0, ay0, ax1, ay1, _, _ = boxes[i]
+            _, bx0, by0, bx1, by1, _, _ = boxes[j]
+            ow = min(ax1, bx1) - max(ax0, bx0)
+            oh = min(ay1, by1) - max(ay0, by0)
+            if ow > 0 and oh > 0:
+                amin = min((ax1 - ax0) * (ay1 - ay0),
+                           (bx1 - bx0) * (by1 - by0))
+                if ow * oh > 0.10 * max(amin, 1.0):
+                    reasons.append(
+                        f"рамки перетинаються: {boxes[i][0]['text'][:18]!r} "
+                        f"і {boxes[j][0]['text'][:18]!r}")
+
+    # --- 3. inpainting: розширюємо маску на 2-3 px і відновлюємо фон
+    kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.dilate(mask, kern, iterations=1)
+    mshare = float((mask > 0).mean())
+    if mshare > 0.35:
+        # inpaint на третині обкладинки — це вже не «прибрати літери», а
+        # знищити арт. Виняток нагору -> OCR-на-місці / оригінал (правило 6).
+        raise ValueError(f"маска inpaint {mshare:.0%} площі обкладинки (>35%)")
+    # inpaint не інтерпретує порядок каналів — годуємо RGB і отримуємо RGB
+    clean = cv2.inpaint(np.ascontiguousarray(arr), mask, 4, cv2.INPAINT_TELEA)
+    work = Image.fromarray(clean)
+
+    # --- 4. переклад поверх: кегль і міжрядковий інтервал від оригіналу
+    draw = ImageDraw.Draw(work)
+    for b, x0, y0, x1, y1, line_h, pitch_ratio in boxes:
         bold = b["role"] == "title"
         fontfile = _FONTS[("sans", bold, False)]
         if not os.path.exists(fontfile):
             raise RuntimeError(f"немає шрифту: {fontfile}")
-        font, lines, size = _fit_cover_font(b["uk"], x1 - x0, y1 - y0, fontfile)
-        total_h = len(lines) * size * 1.15
-        yy = y0 + max(0.0, ((y1 - y0) - total_h) / 2)
+        font, lines, size, pitch_px, fitted = _layout_cover_text(
+            b["uk"], x1 - x0, y1 - y0, fontfile, line_h, pitch_ratio)
+        if not fitted:
+            reasons.append(f"текст не вліз у рамку: {b['uk'][:24]!r}")
+        block_h = size + pitch_px * (len(lines) - 1)
+        yy = y0 + max(0.0, ((y1 - y0) - block_h) / 2)
         for ln in lines:
             lw = font.getlength(ln)
             draw.text((x0 + ((x1 - x0) - lw) / 2, yy), ln,
                       font=font, fill=b["color"])
-            yy += size * 1.15
+            yy += pitch_px
     out = io.BytesIO()
     work.save(out, "PNG")
+    return {"png": out.getvalue(),
+            "status": "doubtful" if reasons else "ok",
+            "reasons": reasons}
+
+
+# ================================================================
+#   ГЕНЕРАТОР ОБКЛАДИНКИ З НУЛЯ — ТІЛЬКИ ЗА ЯВНИМ ЗАПИТОМ (правило 6)
+# ================================================================
+def _kmeans_palette(img, k=4):
+    """3-4 домінантні кольори оригіналу: k-means по пікселях (cv2.kmeans).
+    Повертає [(r,g,b)...] 0..255, відсортовані за часткою пікселів."""
+    import numpy as np
+    import cv2
+    small = img.convert("RGB").resize((64, 96))
+    data = np.asarray(small, dtype=np.float32).reshape(-1, 3)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    # kmeans++ бере стартові центри з глобального RNG OpenCV (thread-local):
+    # без фіксації повторний виклик на тому ж файлі давав ІНШУ палітру
+    cv2.setRNGSeed(7)
+    _c, labels, centers = cv2.kmeans(data, k, None, criteria, 3,
+                                     cv2.KMEANS_PP_CENTERS)
+    counts = np.bincount(labels.ravel(), minlength=k)
+    order = np.argsort(-counts)
+    return [tuple(int(v) for v in centers[i]) for i in order]
+
+
+def _contrast_fg(bg, palette):
+    """Найконтрастніший до фону колір ПАЛІТРИ. Якщо палітра малоконтрастна —
+    той самий колір темнимо/світлимо до читабельності (чужих кольорів не
+    вигадуємо)."""
+    cands = [c for c in palette if c != bg] or [(255, 255, 255)]
+    base = max(cands, key=lambda c: abs(_lum(c) - _lum(bg)))
+    target = 255 if _lum(bg) < 128 else 0
+    c, t = base, 0.0
+    while abs(_lum(c) - _lum(bg)) < 70 and t < 1.0:
+        t += 0.2
+        c = tuple(int(base[i] + (target - base[i]) * t) for i in range(3))
+    return c
+
+
+def generate_cover(vision_json, src_cover_png, w, h):
+    """Нова обкладинка З НУЛЯ: ЧИСТА ТИПОГРАФІКА на палітрі оригіналу.
+    Без градієнтних заглушок і випадкових прикрас. Викликається ТІЛЬКИ явним
+    запитом користувача (окремий ендпоінт /cover/generate); в автоматичний
+    ланцюжок обкладинки НЕ вбудовується (правило 6).
+
+    vision_json — блоки read_cover_blocks (переклад у "uk", без нього "text").
+    w/h — розміри результату; 0 -> розміри src_cover_png.
+    Шаблон обирається за числом елементів: <=2 центрований, ==3 верхній блок,
+    >=4 нижня плашка. Ієрархія кеглів: title > subtitle > author > other."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    src = Image.open(io.BytesIO(src_cover_png)).convert("RGB")
+    if not w or not h:
+        w, h = src.size
+
+    items = []
+    for it in (vision_json or []):
+        text = str(it.get("uk") or it.get("text") or "").strip()
+        if not text:
+            continue
+        role = str(it.get("role", "other")).lower()
+        if role not in ("title", "subtitle", "author", "other"):
+            role = "other"
+        items.append((role, text))
+    if not items:
+        raise ValueError("generate_cover: немає текстових блоків")
+
+    pal = _kmeans_palette(src, 4)
+    bg = pal[0]
+    fg = _contrast_fg(bg, pal)
+    accent = next((c for c in pal[1:] if c != fg
+                   and abs(_lum(c) - _lum(bg)) >= 25), fg)
+
+    n = len(items)                      # шаблон — за числом елементів зору
+    template = "centered" if n <= 2 else ("top" if n == 3 else "band")
+    title = " ".join(t for r, t in items if r == "title")
+    if not title:                       # зір не дав title — перший блок ним стає
+        title, items = items[0][1], items[1:]
+    subtitles = [t for r, t in items if r == "subtitle"]
+    authors = [t for r, t in items if r == "author"]
+    others = [t for r, t in items if r == "other" and t != title]
+
+    img = Image.new("RGB", (w, h), bg)
+    draw = ImageDraw.Draw(img)
+    margin = int(w * 0.08)
+    col_w = w - 2 * margin
+    f_bold, f_reg = _FONTS[("sans", True, False)], _FONTS[("sans", False, False)]
+
+    def fit(text, fontfile, start, max_lines=3, min_size=14):
+        size = max(min_size, int(start))
+        while size > min_size:
+            f = ImageFont.truetype(fontfile, size)
+            lines = _wrap_by_width(f, text, col_w)
+            if (len(lines) <= max_lines
+                    and all(f.getlength(l) <= col_w for l in lines)):
+                return f, lines, size
+            size -= 2
+        f = ImageFont.truetype(fontfile, min_size)
+        return f, _wrap_by_width(f, text, col_w), min_size
+
+    def put(text, fontfile, start, y, color, max_lines=3):
+        """Центрований багаторядковий блок від верхньої межі y -> нижня межа."""
+        f, lines, sz = fit(text, fontfile, start, max_lines)
+        for ln in lines:
+            lw = f.getlength(ln)
+            draw.text((margin + (col_w - lw) / 2, y), ln, font=f, fill=color)
+            y += sz * 1.18
+        return y
+
+    t_f, t_lines, t_sz = fit(title.upper(), f_bold, h * 0.085)
+    sub_sz, auth_sz, oth_sz = t_sz * 0.50, t_sz * 0.42, max(14, t_sz * 0.32)
+
+    if template == "band":
+        draw.rectangle([0, h * 0.86, w, h], fill=accent)
+
+    # автори — завжди зверху (своя строка на кожного)
+    y = h * (0.07 if template != "centered" else 0.10)
+    for a in authors:
+        y = put(a, f_reg, auth_sz, y, fg, max_lines=1) + h * 0.004
+
+    # заголовок: центрований шаблон тримає оптичний центр, інші — верхній блок
+    t_block = len(t_lines) * t_sz * 1.18
+    ty = (h * 0.40 - t_block / 2) if template != "top" else h * 0.26
+    ty = max(ty, y + h * 0.03)
+    for ln in t_lines:
+        lw = t_f.getlength(ln)
+        draw.text((margin + (col_w - lw) / 2, ty), ln, font=t_f, fill=fg)
+        ty += t_sz * 1.18
+    # тонка акцентна лінія під назвою (палітра, без прикрас)
+    ly = ty + h * 0.018
+    draw.rectangle([w * 0.37, ly, w * 0.63, ly + max(3, int(h * 0.005))],
+                   fill=accent if template != "band" else fg)
+    y = ly + h * 0.035
+
+    for s in subtitles:
+        y = put(s, f_reg, sub_sz, y, fg, max_lines=3) + h * 0.008
+
+    if others:
+        if template == "band":
+            oy = h * 0.885
+            ocol = _contrast_fg(accent, pal)
+        else:
+            oy = h * 0.84
+            ocol = fg
+        for o in others:
+            oy = put(o, f_reg, oth_sz, oy, ocol, max_lines=2) + h * 0.004
+
+    out = io.BytesIO()
+    img.save(out, "PNG")
     return out.getvalue()
