@@ -393,12 +393,13 @@ def _make_batches(items_len, length_of, char_budget):
 
 def translate_blocks(texts, api_key, provider="gemini", model=None,
                      src="ru", dst="uk", char_budget=2500, proofread=False,
-                     progress_cb=None, glossary=None):
+                     progress_cb=None, glossary=None, extra_sys=""):
     """
     Перекладає список рядків. Батчить, перевіряє кількість сегментів,
     fallback по одному. Якщо proofread=True — другий прохід-редактор.
     glossary={термін:переклад} — для єдиної термінології по всій книзі.
-    Прогрес рахується на обидві фази (переклад + редактор).
+    extra_sys — додаткові жорсткі правила в системний промпт (наприклад,
+    для обкладинок). Прогрес рахується на обидві фази (переклад + редактор).
     """
     model = model or _default_model(provider)
     system = _SYS_PROMPT.format(src=_LANG.get(src, src), dst=_LANG.get(dst, dst))
@@ -406,6 +407,8 @@ def translate_blocks(texts, api_key, provider="gemini", model=None,
         gl = "; ".join(f"{k} → {v}" for k, v in glossary.items())
         system += ("\n9. ОБОВ'ЯЗКОВИЙ ГЛОСАРІЙ. Уживай САМЕ ці переклади термінів "
                    "усюди, де вони трапляються (відмінюй за контекстом): " + gl)
+    if extra_sys:
+        system += "\n" + extra_sys
     out = [None] * len(texts)
     total = len(texts)
     phases = 2 if proofread else 1
@@ -1288,6 +1291,17 @@ def _color_mask(region, rgb, thr=48):
     return dist <= thr
 
 
+def _contrast_mask(region):
+    """Фолбек-маска літер за КОНТРАСТОМ (Otsu по яскравості): коли колір від
+    зору не зійшовся з картинкою. Літери = менша за площею сторона порога
+    (текст майже ніколи не займає більшість боксу)."""
+    import cv2
+    gray = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY)
+    _t, bin_ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    m = bin_ > 0
+    return m if float(m.mean()) <= 0.5 else ~m
+
+
 def _mask_lines(m):
     """Рядки тексту з маски літер: горизонтальна проєкція -> відрізки
     [(top, bottom)]. Розриви <=2 px зливаємо, шум <3 px викидаємо."""
@@ -1336,9 +1350,12 @@ def _layout_cover_text(text, box_w, box_h, fontfile, line_h, pitch_ratio,
             min_size * pitch_ratio, False)
 
 
-def _parse_cover_json(raw):
+def _parse_cover_json(raw, img_size=None):
     """Строгий розбір відповіді зору: чистимо ```-огорожі, шукаємо JSON-масив,
-    валідуємо кожен елемент. Сміття -> ValueError (нагору)."""
+    валідуємо кожен елемент. Сміття -> ValueError (нагору).
+    img_size = (w, h) картинки, яку бачив зір: якщо будь-яке значення bbox
+    > 100 — зір віддав ПІКСЕЛІ замість відсотків (траплялося на реальних
+    обкладинках), перераховуємо у відсотки і далі звичайна валідація."""
     s = (raw or "").strip()
     s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s)
     m = re.search(r"\[.*\]", s, re.S)
@@ -1359,6 +1376,10 @@ def _parse_cover_json(raw):
                 or not all(isinstance(v, (int, float)) for v in bb)):
             raise ValueError(f"поганий bbox_pct: {bb!r}")
         x, y, w, h = (float(v) for v in bb)
+        if img_size and any(v > 100 for v in (x, y, w, h)):
+            iw, ih = img_size
+            x, y = x / iw * 100.0, y / ih * 100.0
+            w, h = w / iw * 100.0, h / ih * 100.0
         if not (0 <= x < 100 and 0 <= y < 100 and w > 0 and h > 0):
             raise ValueError(f"bbox_pct поза межами: {bb!r}")
         w = min(w, 100 - x)
@@ -1372,6 +1393,28 @@ def _parse_cover_json(raw):
     if not blocks:
         raise ValueError("зір не знайшов тексту на обкладинці")
     return blocks
+
+
+# Обкладинки: жорстке правило перекладу абревіатур («НЛП» -> «НАП» більше не
+# повториться) — і в промпт, і identity-пінами в глосарій (подвійний захист).
+_ABBR_RULE = (
+    "ДОДАТКОВЕ ЖОРСТКЕ ПРАВИЛО ДЛЯ ОБКЛАДИНКИ: абревіатури та акроніми "
+    "(послідовності ВЕЛИКИХ літер: НЛП, КПТ, ДНК, NLP, CBT) копіюй "
+    "ПОСИМВОЛЬНО, без перекладу, без транслітерації і без заміни літер: "
+    "«НЛП» лишається «НЛП».")
+
+
+def _abbr_tokens(texts):
+    """Кандидати-абревіатури з текстів обкладинки: латинські 2-5 ВЕЛИКИХ
+    літер або кириличні 2-5 ВЕЛИКИХ без голосних (НЛП, КПТ, ДНК; слова типу
+    КЛЮЧИ/МАГИЯ мають голосні й не чіпаються)."""
+    out = set()
+    for t in texts:
+        for tok in re.findall(r"\b[А-ЯЁЇІЄҐA-Z]{2,5}\b", t or ""):
+            if (re.fullmatch(r"[A-Z]{2,5}", tok)
+                    or not re.search(r"[АЕЁИОУЫЭЮЯЇІЄ]", tok)):
+                out.add(tok)
+    return out
 
 
 def read_cover_blocks(cover_png_bytes, api_key, glossary=None,
@@ -1405,18 +1448,22 @@ def read_cover_blocks(cover_png_bytes, api_key, glossary=None,
     try:
         blocks = _parse_cover_json(_vision_call(
             "gemini", api_key, model, _COVER_VISION_PROMPT, img_b64,
-            gen_config=cfg))
+            gen_config=cfg), img_size=vimg.size)
     except ValueError:
         reasons.append("зір повернув битий JSON (вдалося з 2-ї спроби)")
         blocks = _parse_cover_json(_vision_call(
             "gemini", api_key, model,
             _COVER_VISION_PROMPT + "\nYour previous output was NOT valid JSON. "
             "Return ONLY the syntactically valid JSON array.",
-            img_b64, gen_config=cfg))
+            img_b64, gen_config=cfg), img_size=vimg.size)
 
     texts = [b["text"] for b in blocks]
+    gl = dict(glossary or {})
+    for tok in sorted(_abbr_tokens(texts)):
+        gl.setdefault(tok, tok)               # identity-пін: НЛП -> НЛП
     tr = translate_blocks(texts, api_key, provider="gemini", model=model,
-                          src=src, dst=dst, glossary=glossary)
+                          src=src, dst=dst, glossary=gl or None,
+                          extra_sys=_ABBR_RULE)
     for b, t in zip(blocks, tr):
         b["uk"] = (t or "").strip() or b["text"]
     return blocks, reasons
@@ -1457,16 +1504,23 @@ def translate_cover_vision(cover_png_bytes, api_key, glossary=None,
         ix1, iy1 = min(W, int(x1 + pad) + 1), min(H, int(y1 + pad) + 1)
         if ix1 <= ix0 or iy1 <= iy0:
             raise ValueError(f"порожня рамка тексту: {b['text'][:30]!r}")
-        sub = _color_mask(arr[iy0:iy1, ix0:ix1], b["color"])
+        region = arr[iy0:iy1, ix0:ix1]
+        sub = _color_mask(region, b["color"])
+        if float(sub.mean()) < 0.005:            # ширший допуск за відстанню
+            sub = _color_mask(region, b["color"], thr=90)
+        if float(sub.mean()) < 0.005:            # колір зовсім не зійшовся ->
+            sub = _contrast_mask(region)         # фолбек: поріг за яскравістю
+            reasons.append(f"колір зору не зійшовся, маска за контрастом: "
+                           f"{b['text'][:24]!r}")
         runs = _mask_lines(sub)
         if float(sub.mean()) < 0.005 or not runs:
-            # колір від зору не зійшовся з літерами: затирати наосліп і малювати
-            # кеглем «на всю рамку» = знищити обкладинку. Виняток нагору ->
+            # і контраст не дав літер: затирати наосліп і малювати кеглем
+            # «на всю рамку» = знищити обкладинку. Виняток нагору ->
             # ланцюжок піде в OCR-на-місці / оригінал (правило 6).
-            raise ValueError(f"маска літер порожня (колір зору не зійшовся "
-                             f"з літерами): {b['text'][:30]!r}")
-        region = mask[iy0:iy1, ix0:ix1]
-        region[sub] = 255
+            raise ValueError(f"маска літер порожня (ні колір, ні контраст "
+                             f"не дали літер): {b['text'][:30]!r}")
+        mview = mask[iy0:iy1, ix0:ix1]
+        mview[sub] = 255
         heights = sorted(bb - aa for aa, bb in runs)
         line_h = heights[len(heights) // 2]
         if len(runs) > 1:
