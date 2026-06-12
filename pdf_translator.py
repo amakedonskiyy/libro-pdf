@@ -1417,12 +1417,147 @@ def _abbr_tokens(texts):
     return out
 
 
+# ---- джерело істини: текстовий шар внутрішнього титулу + глосарій -----------
+# Зір помилково ЧИТАЄ стилізований логотип («НЛП» бачить як «НАП»). Але
+# всередині книги є чистий текстовий шар (титульна сторінка), де ті самі назва
+# й автори стоять правильно. Звіряємо прочитане зором із цим джерелом.
+def _levenshtein(a, b):
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if not la or not lb:
+        return la or lb
+    prev = list(range(lb + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                           prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[lb]
+
+
+def _first_pages_blocks(pdf_bytes, max_pages=6):
+    """Лёгке читання текстових блоків перших сторінок БЕЗ OCR (для джерела
+    істини обкладинки): [{text, size}] по сторінці. Швидко навіть на 300+ стор."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    out = []
+    for pno in range(min(max_pages, doc.page_count)):
+        blocks = []
+        for b in doc[pno].get_text("dict")["blocks"]:
+            if b.get("type") != 0:
+                continue
+            txt = re.sub(r"\s+", " ",
+                         " ".join(s["text"] for ln in b["lines"]
+                                  for s in ln["spans"])).strip()
+            if not txt:
+                continue
+            size = max((s["size"] for ln in b["lines"] for s in ln["spans"]),
+                       default=0)
+            blocks.append({"text": txt, "size": size})
+        out.append(blocks)
+    doc.close()
+    return out
+
+
+def _cover_reference(pdf_bytes, api_key, glossary, src, dst, model):
+    """Назва й автори з текстового шару внутрішнього титулу + їх ПРАВИЛЬНИЙ
+    переклад тим самим движком/глосарієм. Повертає (wordmap, strings):
+    wordmap = {слово_lower: канонічна_форма_оригіналу}, strings = [{orig, uk}].
+    Будь-яка помилка -> порожньо (корекція просто не застосується)."""
+    wordmap, strings = {}, []
+    try:
+        pages = _first_pages_blocks(pdf_bytes)
+    except Exception as e:
+        print("cover reference: extract failed:", e)
+        return wordmap, strings
+    cand = []
+    for blk in pages:
+        if not blk:
+            continue                       # обкладинка-картинка -> наступна
+        for b in blk:                      # перший НЕПОРОЖНІЙ титул
+            t = re.sub(r"\s+", " ", b["text"]).strip()
+            if 2 <= len(t) <= 70 and not _looks_garbled(t):
+                cand.append(t)
+        break
+    seen, uniq = set(), []
+    for c in cand:
+        if c.lower() not in seen:
+            seen.add(c.lower()); uniq.append(c)
+    uniq = uniq[:12]
+    if not uniq:
+        return wordmap, strings
+    try:
+        tr = translate_blocks(uniq, api_key, provider="gemini", model=model,
+                              src=src, dst=dst, glossary=glossary,
+                              extra_sys=_ABBR_RULE)
+    except Exception as e:
+        print("cover reference: translate failed:", e)
+        tr = list(uniq)
+    for i, c in enumerate(uniq):
+        uk = ((tr[i] if i < len(tr) else c) or c).strip()
+        strings.append({"orig": c, "uk": uk})
+        for w in re.findall(r"\w+", c, re.U):
+            if len(w) >= 2:
+                wordmap.setdefault(w.lower(), w)
+    return wordmap, strings
+
+
+def _correct_text_by_words(text, wordmap):
+    """Пословно править розпізнаний ОРИГІНАЛ за відомими словами титулу
+    (Левенштейн<=2, із захистом від хибних замін на коротких словах).
+    Регістр переносимо з токена (ВЕРХНІЙ лишається ВЕРХНІМ)."""
+    if not wordmap:
+        return text, False
+    parts = re.split(r"(\W+)", text, flags=re.U)
+    changed = False
+    for k, tok in enumerate(parts):
+        if not tok or not tok.strip() or len(tok) < 2:
+            continue
+        low = tok.lower()
+        known = wordmap.get(low)
+        if known is None:
+            best, bestd = None, 99
+            for lw, kw in wordmap.items():
+                if abs(len(lw) - len(low)) > 2:
+                    continue
+                d = _levenshtein(low, lw)
+                if d < bestd:
+                    bestd, best = d, kw
+            # поріг: dist 1 для слів >=2 літер; dist 2 лише для слів >=4 літер
+            if best is not None and ((bestd == 1 and len(low) >= 2)
+                                     or (bestd == 2 and len(low) >= 4)):
+                known = best
+        if known and known.lower() != low:
+            parts[k] = known.upper() if tok.isupper() else known
+            changed = True
+    return "".join(parts), changed
+
+
+def _override_uk_by_truth(text, strings):
+    """Якщо блок майже збігається з відомим рядком титулу — повертаємо його
+    КАНОНІЧНИЙ переклад (із чистого текстового шару), інакше None."""
+    norm = re.sub(r"\s+", " ", text.strip()).lower()
+    if len(norm) < 3:
+        return None
+    for s in strings:
+        so = re.sub(r"\s+", " ", s["orig"].strip()).lower()
+        if not so:
+            continue
+        if norm == so or (len(norm) >= 6 and _levenshtein(norm, so) <= 2):
+            return s["uk"]
+    return None
+
+
 def read_cover_blocks(cover_png_bytes, api_key, glossary=None,
-                      src="ru", dst="uk", model=None):
+                      src="ru", dst="uk", model=None, pdf_bytes=None):
     """Зір (Gemini) читає обкладинку + переклад блоків (з глосарієм книги,
     якщо є). Повертає (blocks, reasons): blocks = [{text, uk, bbox_pct,
     color, role}], reasons — сигнали якості (наприклад, битий JSON з першої
-    спроби). Будь-яка фатальна помилка -> виняток нагору."""
+    спроби). pdf_bytes (опц.) — звіряємо прочитане зором із текстовим шаром
+    внутрішнього титулу: помилки розпізнавання стилізованих логотипів
+    («НЛП»→«НАП») виправляються на канонічну форму. Будь-яка фатальна
+    помилка -> виняток нагору."""
     import base64
     from PIL import Image
 
@@ -1457,6 +1592,18 @@ def read_cover_blocks(cover_png_bytes, api_key, glossary=None,
             "Return ONLY the syntactically valid JSON array.",
             img_b64, gen_config=cfg), img_size=vimg.size)
 
+    # звірка з джерелом істини (текстовий шар титулу): виправляємо помилки
+    # ЧИТАННЯ зором ДО перекладу, щоб правило абревіатур копіювало вже вірне
+    wordmap, strings = ({}, [])
+    if pdf_bytes is not None:
+        wordmap, strings = _cover_reference(pdf_bytes, api_key, glossary,
+                                            src, dst, model)
+        for b in blocks:
+            fixed, changed = _correct_text_by_words(b["text"], wordmap)
+            if changed:
+                print(f"cover: звірено з титулом {b['text']!r} -> {fixed!r}")
+                b["text"] = fixed
+
     texts = [b["text"] for b in blocks]
     gl = dict(glossary or {})
     for tok in sorted(_abbr_tokens(texts)):
@@ -1466,11 +1613,18 @@ def read_cover_blocks(cover_png_bytes, api_key, glossary=None,
                           extra_sys=_ABBR_RULE)
     for b, t in zip(blocks, tr):
         b["uk"] = (t or "").strip() or b["text"]
+    # відомий переклад із чистого титулу — пріоритетніший за переклад
+    # (можливо спотвореного) тексту обкладинки
+    if strings:
+        for b in blocks:
+            ov = _override_uk_by_truth(b["text"], strings)
+            if ov:
+                b["uk"] = ov
     return blocks, reasons
 
 
 def translate_cover_vision(cover_png_bytes, api_key, glossary=None,
-                           src="ru", dst="uk", model=None):
+                           src="ru", dst="uk", model=None, pdf_bytes=None):
     """Зір читає обкладинку -> переклад -> ПРИБИРАННЯ оригінальних літер через
     inpainting (cv2.INPAINT_TELEA: фон ВІДНОВЛЮЄТЬСЯ, а не замальовується
     прямокутником) -> поверх переклад DejaVu (bold для title) кольором
@@ -1486,7 +1640,7 @@ def translate_cover_vision(cover_png_bytes, api_key, glossary=None,
 
     blocks, reasons = read_cover_blocks(cover_png_bytes, api_key,
                                         glossary=glossary, src=src, dst=dst,
-                                        model=model)
+                                        model=model, pdf_bytes=pdf_bytes)
     img = Image.open(io.BytesIO(cover_png_bytes)).convert("RGB")
     W, H = img.size
     arr = np.asarray(img, dtype=np.uint8)

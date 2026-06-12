@@ -206,8 +206,32 @@ def check_generate_cover():
         fail(f"generate_cover: размер {out.size} вместо (300, 450)")
 
 
+def check_cover_truth_correction():
+    """Сверка vision-чтения обложки с текстовым слоем титула (без сети):
+    «НАП» (дизайнерская Л≈А) -> «НЛП» по известному слову; далёкие слова не
+    трогаются; известный перевод подменяет рендер."""
+    if P._levenshtein("нап", "нлп") != 1 or P._levenshtein("кот", "нлп") != 3:
+        fail("_levenshtein считает неверно")
+    wm = {"нлп": "НЛП", "яростное": "ЯРОСТНОЕ", "пелехатый": "Пелехатый"}
+    fixed, ch = P._correct_text_by_words("НАП", wm)
+    if fixed != "НЛП" or not ch:
+        fail(f"коррекция НАП->НЛП не сработала: {fixed!r} changed={ch}")
+    # точный заголовок не трогаем
+    if P._correct_text_by_words("ЯРОСТНОЕ", wm) != ("ЯРОСТНОЕ", False):
+        fail("ложная коррекция точного слова ЯРОСТНОЕ")
+    # далёкое короткое слово не подменяем
+    if P._correct_text_by_words("КОТ", wm)[1]:
+        fail("ложная коррекция далёкого слова КОТ")
+    # известный перевод для рендера
+    if P._override_uk_by_truth("Михаил Пелехатый",
+                               [{"orig": "Михаил Пелехатый",
+                                 "uk": "Михайло Пелехатий"}]) != "Михайло Пелехатий":
+        fail("_override_uk_by_truth не подменил известный перевод")
+
+
 def main():
     check_garbled_calibration()
+    check_cover_truth_correction()
     make_sample()
     with open(SAMPLE, "rb") as f:
         pdf_bytes = f.read()

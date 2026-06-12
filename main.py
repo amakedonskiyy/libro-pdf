@@ -72,7 +72,7 @@ def supa_upload_result(path, pdf_bytes):
     return SUPA_URL + "/storage/v1" + r.json()["signedURL"]
 
 
-ENGINE_VERSION = "2026-06-12-cover-v2-1"
+ENGINE_VERSION = "2026-06-12-cover-v2-2"
 
 
 def _safe_err(e, limit=200):
@@ -178,7 +178,8 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
                         res = P.translate_cover_vision(png, api_key,
                                                        glossary=glossary,
                                                        src=src, dst=dst,
-                                                       model=model or None)
+                                                       model=model or None,
+                                                       pdf_bytes=pdf_bytes)
                         cov = res["png"]
                         # сигнал якості для кнопки на фронті; рішення за людиною
                         JOBS[job_id]["cover_status"] = res["status"]
@@ -304,7 +305,8 @@ def cover_generate(file: UploadFile = File(...), api_key: str = Form(...),
         png = P.render_cover_png(pdf_bytes)
         blocks, _reasons = P.read_cover_blocks(png, api_key, glossary=None,
                                                src=src, dst=dst,
-                                               model=model or None)
+                                               model=model or None,
+                                               pdf_bytes=pdf_bytes)
         out = P.generate_cover(blocks, png, 0, 0)
     except P._ClientError as e:
         # 4xx від LLM (ключ/модель) — помилка користувача, без ретраїв (правило 7)
