@@ -72,7 +72,7 @@ def supa_upload_result(path, pdf_bytes):
     return SUPA_URL + "/storage/v1" + r.json()["signedURL"]
 
 
-ENGINE_VERSION = "2026-06-12-cover-v2-2"
+ENGINE_VERSION = "2026-06-13-reflow-v1"
 
 
 def _safe_err(e, limit=200):
@@ -106,18 +106,121 @@ def translate_sync(file: UploadFile = File(...), api_key: str = Form(...),
 
 
 # ----------- ФОНОВА ЧЕРГА без Supabase (для великих книг через браузер) -----------
+def _reflow_cover_png(job_id, pdf_bytes, api_key, provider, model, src, dst,
+                      glossary, cover_mode, log):
+    """PNG обкладинки для reflow-книги. cover_mode: generate (дефолт reflow,
+    бо чистій книзі — чиста обкладинка) | replace (vision/inpaint на місці) |
+    original. Явний вибір користувача важливіший за дефолт. Будь-який збій ->
+    рендер оригінальної обкладинки (гірше за оригінал не робимо)."""
+    try:
+        orig = P.render_cover_png(pdf_bytes)
+    except Exception as e:
+        log(f"reflow cover: render original failed: {_safe_err(e)}")
+        return None
+    mode = (cover_mode or "generate").lower()
+    if mode not in ("generate", "replace", "original"):
+        mode = "generate"
+    if mode == "original" or provider != "gemini":
+        if mode != "original":
+            log("reflow cover: provider != gemini -> оригінальна обкладинка")
+        return orig
+    try:
+        if mode == "generate":
+            blocks, reasons = P.read_cover_blocks(orig, api_key,
+                                                  glossary=glossary, src=src,
+                                                  dst=dst, model=model or None,
+                                                  pdf_bytes=pdf_bytes)
+            png = P.generate_cover(blocks, orig, 0, 0)
+        else:                                  # replace: vision/inpaint
+            res = P.translate_cover_vision(orig, api_key, glossary=glossary,
+                                           src=src, dst=dst,
+                                           model=model or None,
+                                           pdf_bytes=pdf_bytes)
+            png, reasons = res["png"], res["reasons"]
+        JOBS[job_id]["cover_status"] = "doubtful" if reasons else "ok"
+        if reasons:
+            JOBS[job_id]["cover_reasons"] = reasons[:8]
+        log(f"reflow cover: {mode} ok")
+        return png
+    except Exception as e:
+        JOBS[job_id]["cover_status"] = "failed"
+        JOBS[job_id]["cover_reasons"] = [_safe_err(e)]
+        log(f"reflow cover {mode} failed -> оригінальна: {_safe_err(e)}")
+        return orig
+
+
 def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
                    proofread, filename, vision=False, vision_model="",
-                   cover_vision=False):
+                   cover_vision=False, layout_mode="preserve", cover_mode="",
+                   reuse_tr=None):
     import sys
     def log(m):
         print(f"[job {job_id}] {m}", flush=True); sys.stdout.flush()
     try:
         JOBS[job_id].update(status="processing", progress=1)
-        log(f"start [{ENGINE_VERSION}]: {len(pdf_bytes)//1024}KB, provider={provider}, model={model!r}, src={src}, vision={vision}, cover_vision={cover_vision}")
+        log(f"start [{ENGINE_VERSION}]: {len(pdf_bytes)//1024}KB, provider={provider}, model={model!r}, src={src}, vision={vision}, cover_vision={cover_vision}, layout={layout_mode}")
 
         def cb(done, total):
             JOBS[job_id]["progress"] = max(1, min(99, int(done / max(total, 1) * 99)))
+
+        # ---------------- REFLOW: пересборка книги «з нуля» чистим PDF ----------------
+        if layout_mode == "reflow":
+            log("reflow: extract lines + paragraphs...")
+            flow, _wh, _tp = P.build_reflow_flow(
+                pdf_bytes, ocr_lang=P._LANG_OCR.get(src, "rus"))
+            tidx = [i for i, el in enumerate(flow)
+                    if el["kind"] in ("h1", "h2", "h3", "para")]
+            if not tidx:
+                raise RuntimeError("reflow: у книзі не знайдено тексту "
+                                   "(справжній скан без OCR-шару?)")
+            nimg = sum(1 for el in flow if el["kind"] == "image")
+            npimg = sum(1 for el in flow if el["kind"] == "pageimg")
+            log(f"reflow: text elements={len(tidx)}, inflow images={nimg}, "
+                f"full-page images={npimg}")
+            texts = [flow[i]["text"] for i in tidx]
+            log("building glossary (term consistency)...")
+            glossary = P.build_glossary(texts, api_key, provider=provider,
+                                        model=model or None, src=src, dst=dst)
+            log(f"glossary: {len(glossary)} terms")
+            # rebuild: переклади вихідного job у пам'яті -> не палимо API двічі
+            pre = {}
+            if reuse_tr:
+                def _norm(t):
+                    return re.sub(r"[\s\-­]+", "", t or "").lower()
+                rmap = {_norm(o): u for o, u in reuse_tr.items()
+                        if (o or "").strip() and (u or "").strip()}
+                for i in tidx:
+                    u = rmap.get(_norm(flow[i]["text"]))
+                    if u:
+                        flow[i]["uk"] = u
+                        pre[i] = True
+                log(f"reflow: reuse {len(pre)}/{len(tidx)} перекладів")
+            need = [i for i in tidx if i not in pre]
+            if need:
+                log(f"translate_blocks: {len(need)} elements...")
+                tr = P.translate_blocks([flow[i]["text"] for i in need],
+                                        api_key, provider=provider,
+                                        model=model or None, src=src, dst=dst,
+                                        proofread=proofread, progress_cb=cb,
+                                        glossary=glossary)
+                for k, i in enumerate(need):
+                    flow[i]["uk"] = tr[k]
+            log("reflow: title page meta...")
+            meta = P.reflow_title_meta(pdf_bytes, api_key, glossary, src, dst,
+                                       model or None)
+            cover_png = _reflow_cover_png(job_id, pdf_bytes, api_key, provider,
+                                          model, src, dst, glossary,
+                                          cover_mode, log)
+            log("build_pdf_reflow...")
+            out = P.build_pdf_reflow(pdf_bytes, flow, meta, cover_png=cover_png)
+            JOBS[job_id]["src_texts"] = {flow[i]["text"]: flow[i].get("uk", "")
+                                         for i in tidx}
+            log(f"done: {len(out)//1024}KB")
+            path = os.path.join(JOB_DIR, f"{job_id}.pdf")
+            with open(path, "wb") as f:
+                f.write(out)
+            JOBS[job_id].update(status="done", progress=100, path=path)
+            return
 
         recipe = {}
         if vision:
@@ -159,6 +262,10 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
                                     glossary=glossary)
             log("build_pdf...")
             tmap = {flat[i][0]: tr[i] for i in range(len(flat))}
+            # переклади лишаються в пам'яті процесу: /jobs/{id}/rebuild
+            # перевикористає їх і не палитиме API вдруге
+            JOBS[job_id]["src_texts"] = {flat[i][1]: tr[i]
+                                         for i in range(len(flat))}
             out = P.build_pdf(pdf_bytes, pages, tmap, recipe=recipe)
             # ОБКЛАДИНКА: якщо 1-ша сторінка — суцільна картинка (0 текстових
             # блоків), на текстовому шляху вона лишилась би мовою оригіналу.
@@ -236,21 +343,79 @@ async def create_job(background: BackgroundTasks,
                      src: str = Form("ru"), dst: str = Form("uk"),
                      proofread: bool = Form(False),
                      vision: bool = Form(False), vision_model: str = Form(""),
-                     cover_vision: bool = Form(False)):
+                     cover_vision: bool = Form(False),
+                     layout_mode: str = Form("preserve"),
+                     cover_mode: str = Form("")):
     """Запускає фонову задачу. Одразу повертає job_id (без таймауту).
-    cover_vision=true -> обкладинку читає зір (Gemini) і перемальовує;
-    за замовчуванням false (увімкнемо після калібрування)."""
+    cover_vision=true -> обкладинку читає зір (Gemini) і перемальовує.
+    layout_mode: preserve (як є, дефолт) | reflow (пересборка чистою книгою —
+    запасний режим для сканів і вбитої верстки).
+    cover_mode (для reflow): generate (дефолт) | replace | original."""
+    if layout_mode not in ("preserve", "reflow"):
+        raise HTTPException(400, "layout_mode: preserve | reflow")
     pdf_bytes = await file.read()
     job_id = uuid.uuid4().hex[:12]
     base = (file.filename or "book").rsplit(".", 1)[0]
-    JOBS[job_id] = {"status": "queued", "progress": 0, "name": f"{base}_uk.pdf"}
+    suffix = "_uk_reflow.pdf" if layout_mode == "reflow" else "_uk.pdf"
+    JOBS[job_id] = {"status": "queued", "progress": 0, "name": f"{base}{suffix}",
+                    "params": {"provider": provider, "model": model, "src": src,
+                               "dst": dst, "proofread": proofread,
+                               "layout_mode": layout_mode}}
+    # вихідник на диск: /jobs/{id}/rebuild читає його звідси (і після рестарту)
+    try:
+        with open(os.path.join(JOB_DIR, f"{job_id}.src.pdf"), "wb") as f:
+            f.write(pdf_bytes)
+    except Exception as e:
+        print("src save failed:", e)
     background.add_task(_run_local_job, job_id, pdf_bytes, api_key, provider,
                         model, src, dst, proofread, file.filename, vision,
-                        vision_model, cover_vision)
+                        vision_model, cover_vision, layout_mode, cover_mode)
     return JSONResponse({
         "job_id": job_id,
         "status_url": f"/jobs/{job_id}",
         "download_url": f"/jobs/{job_id}/download",
+    }, status_code=202)
+
+
+@app.post("/jobs/{job_id}/rebuild")
+async def rebuild_job(job_id: str, background: BackgroundTasks,
+                      api_key: str = Form(...), model: str = Form(""),
+                      cover_mode: str = Form("")):
+    """Пересборка ГОТОВОГО перекладу чистим reflow-PDF: новий job у режимі
+    reflow з ТОГО Ж вихідника. Якщо переклади вихідного job ще в пам'яті
+    процесу — вони перевикористовуються (API вдруге не палиться); після
+    рестарту сервера — чесний повний прогін. Відповідь — як у POST /jobs."""
+    src_path = os.path.join(JOB_DIR, f"{job_id}.src.pdf")
+    j = JOBS.get(job_id) or {}
+    if not os.path.exists(src_path):
+        raise HTTPException(404, "вихідний PDF цього job не знайдено (старий "
+                                 "job або диск очищено) — завантаж книгу "
+                                 "заново через POST /jobs із layout_mode=reflow")
+    with open(src_path, "rb") as f:
+        pdf_bytes = f.read()
+    params = j.get("params", {})
+    new_id = uuid.uuid4().hex[:12]
+    base = (j.get("name") or "book_uk.pdf").split("_uk")[0]
+    JOBS[new_id] = {"status": "queued", "progress": 0,
+                    "name": f"{base}_uk_reflow.pdf", "rebuild_of": job_id,
+                    "params": dict(params, layout_mode="reflow")}
+    try:
+        with open(os.path.join(JOB_DIR, f"{new_id}.src.pdf"), "wb") as f:
+            f.write(pdf_bytes)
+    except Exception as e:
+        print("src save failed:", e)
+    reuse = j.get("src_texts") or None
+    background.add_task(_run_local_job, new_id, pdf_bytes, api_key,
+                        params.get("provider", "gemini"),
+                        model or params.get("model", ""),
+                        params.get("src", "ru"), params.get("dst", "uk"),
+                        params.get("proofread", False), j.get("name"),
+                        False, "", False, "reflow", cover_mode, reuse)
+    return JSONResponse({
+        "job_id": new_id,
+        "status_url": f"/jobs/{new_id}",
+        "download_url": f"/jobs/{new_id}/download",
+        "reused_translations": bool(reuse),
     }, status_code=202)
 
 
@@ -259,7 +424,8 @@ def job_status(job_id: str):
     j = JOBS.get(job_id)
     if not j:
         return JSONResponse({"status": "unknown"}, status_code=404)
-    return {k: v for k, v in j.items() if k != "path"}
+    return {k: v for k, v in j.items()
+            if k not in ("path", "src_texts", "params")}
 
 
 @app.get("/jobs/{job_id}/download")

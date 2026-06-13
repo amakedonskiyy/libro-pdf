@@ -16,6 +16,7 @@ __pycache__/
 # --- Test outputs (обложки/прогоны не коммитятся) ---
 tests/out_*
 tests/sample_*.pdf
+tests/reflow_preview_*
 
 # --- Локальные DejaVu TTF для мака (на проде шрифты ставит Dockerfile) ---
 .fonts/

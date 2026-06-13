@@ -1882,3 +1882,540 @@ def generate_cover(vision_json, src_cover_png, w, h):
     out = io.BytesIO()
     img.save(out, "PNG")
     return out.getvalue()
+
+
+# ================================================================
+#        REFLOW: пересборка книги «с нуля» чистым PDF (v2)
+# ================================================================
+# Запасной режим для сканов и убитой вёрстки: текст добывается тем же
+# конвейером (текстовый слой или OCR), склеивается в абзацы, переводится
+# и НАБИРАЕТСЯ заново книжной типографикой (DejaVu Serif/Sans, поля,
+# оглавление, номера страниц). Координаты оригинала не сохраняются.
+
+# старий зміст оригіналу в потік не несемо — у книги буде свій новий
+_TOC_TITLES = ("содержание", "оглавление", "contents", "зміст", "змiст")
+
+# заголовок рівня частини/глави — завжди H1 (з нової сторінки, у зміст),
+# навіть якщо на скані його кегль лише трохи більший за основний текст
+_H1_KW = re.compile(r"^(?:частина|часть|розділ|раздел|глава|part|chapter)\b",
+                    re.I)
+
+
+def _is_old_toc_page(plines):
+    """Сторінка старого змісту: верхній рядок — «Содержание/Оглавление/Зміст»
+    АБО більшість рядків мають крапки-лідери з номером у кінці."""
+    head = re.sub(r"\s+", "", " ".join(l["text"] for l in plines[:2])).lower()
+    if any(head.startswith(t) for t in _TOC_TITLES):
+        return True
+    leaders = sum(1 for l in plines
+                  if re.search(r"[.…]{2,}\s*\d{1,4}\s*$", l["text"]))
+    return len(plines) >= 4 and leaders >= max(3, len(plines) // 2)
+
+
+def _page_is_blank(page):
+    """Майже однотонна сторінка (порожній/білий скан) — у потік НЕ йде, на
+    відміну від справжньої ілюстрації-пластини."""
+    try:
+        pix = page.get_pixmap(matrix=fitz.Matrix(0.25, 0.25),
+                              colorspace=fitz.csGRAY)
+        data = pix.samples
+        if not data:
+            return True
+        return (max(data) - min(data)) < 24
+    except Exception:
+        return False
+
+
+def _reflow_extract(pdf_bytes, ocr_lang="rus"):
+    """Сторінки -> рядки {text,x0,x1,y0,y1,size} + картинки.
+    Текстовий шар є -> get_text("dict") по РЯДКАХ (працює і для сканів із
+    вшитим OCR-шаром); немає -> OCR Tesseract-ом (як у translate_scanned_pdf).
+    Повертає (pages_lines, fullpage_imgs:set, inflow_imgs:list, (W,H))."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if doc.page_count == 0:
+        doc.close()
+        raise ValueError("порожній PDF")
+    W, H = doc[0].rect.width, doc[0].rect.height
+    pages, fullpage, inflow = [], set(), []
+    for pno, page in enumerate(doc):
+        lines = []
+        for b in page.get_text("dict")["blocks"]:
+            if b.get("type") != 0:
+                continue
+            for ln in b["lines"]:
+                txt = "".join(s["text"] for s in ln["spans"]).strip()
+                if not txt:
+                    continue
+                szs = [s["size"] for s in ln["spans"] if s["text"].strip()]
+                x0, y0, x1, y1 = ln["bbox"]
+                lines.append({"text": txt, "x0": x0, "x1": x1, "y0": y0,
+                              "y1": y1, "size": max(szs) if szs else y1 - y0})
+        nch = sum(len(l["text"]) for l in lines)
+        if nch < 40:                       # справжній скан без шару -> OCR
+            try:
+                for l in _ocr_lines(page, ocr_lang):
+                    x0, y0, x1, y1 = l["bbox"]
+                    lines.append({"text": l["text"], "x0": x0, "x1": x1,
+                                  "y0": y0, "y1": y1,
+                                  "size": (y1 - y0) * 0.9})
+                nch = sum(len(l["text"]) for l in lines)
+            except Exception as e:
+                print(f"reflow: OCR p{pno} недоступний: {e}")
+        lines.sort(key=lambda l: (round(l["y0"] / 4), l["x0"]))
+        pages.append(lines)
+        # картинки сторінки
+        try:
+            infos = page.get_image_info(xrefs=True)
+        except Exception:
+            infos = []
+        parea = page.rect.width * page.rect.height
+        for im in infos:
+            bx = im["bbox"]
+            share = max(0.0, (bx[2] - bx[0])) * max(0.0, (bx[3] - bx[1])) / max(parea, 1)
+            if share >= 0.5:
+                # на всю сторінку — це фон-скан майже кожної сторінки книги.
+                # Окрема растрова сторінка ЛИШЕ для справжньої ілюстрації-
+                # пластини: тексту майже нема (короткий шмуцтитул має
+                # реформатуватись як заголовок, а не лягти растром) І сторінка
+                # не порожня (білий скан не несемо).
+                if nch < 12 and not _page_is_blank(page):
+                    fullpage.add(pno)
+            elif share >= 0.02 and im.get("xref"):
+                try:
+                    raw = doc.extract_image(im["xref"])
+                    inflow.append({"page": pno, "y": (bx[1] + bx[3]) / 2,
+                                   "data": raw["image"],
+                                   "w": bx[2] - bx[0], "h": bx[3] - bx[1]})
+                except Exception:
+                    pass
+    doc.close()
+    return pages, fullpage, inflow, (W, H)
+
+
+def _reflow_body_size(pages):
+    """Кегль основного тексту = мода розмірів довгих рядків (квант 0.5)."""
+    from collections import Counter
+    cnt = Counter()
+    for p in pages:
+        for l in p:
+            if len(l["text"]) >= 25:
+                cnt[round(l["size"] * 2) / 2] += 1
+    return cnt.most_common(1)[0][0] if cnt else 11.0
+
+
+def _reflow_artifacts(pages, page_h, body_size):
+    """Артефакти вихідної верстки геть: частотні колонтитули (верх/низ),
+    висячі номери сторінок, рядки старого змісту «текст …… 123».
+    Заголовки захищені кеглем (>=1.25 body не чіпаємо)."""
+    from collections import Counter
+
+    def norm(t):
+        return re.sub(r"\d+", "", t).strip().lower()
+
+    cnt = Counter()
+    npages = sum(1 for p in pages if p) or 1
+    for p in pages:
+        seen = set()
+        for l in p:
+            if l["y0"] < page_h * 0.12 or l["y1"] > page_h * 0.88:
+                n = norm(l["text"])
+                if 3 <= len(n) <= 60 and n not in seen:
+                    seen.add(n)
+                    cnt[n] += 1
+    rep = {n for n, c in cnt.items() if c >= max(3, int(npages * 0.25))}
+    out = []
+    for p in pages:
+        keep = []
+        for l in p:
+            t = l["text"].strip()
+            zone = l["y0"] < page_h * 0.12 or l["y1"] > page_h * 0.88
+            head = l["size"] >= body_size * 1.25
+            if zone and not head and norm(t) in rep:
+                continue                                   # колонтитул
+            if zone and re.fullmatch(r"[\divxlcXVILC]{1,4}", t):
+                continue                                   # голий номер
+            if re.search(r"[.…]{2,}\s*\d{1,4}\s*$", t):
+                continue                                   # рядок старого змісту
+            keep.append(l)
+        out.append(keep)
+    return out
+
+
+def _reflow_paragraphs(lines, body_size, set_left, set_right):
+    """Рядки ОДНІЄЇ сторінки -> елементи [{kind, text, y0}].
+    kind: h1/h2/h3 (за кеглем відносно моди) або para.
+    Новий абзац: відступ першого рядка, порожній рядок (великий проміжок),
+    попередній рядок коротший ~60% ширини набору + новий з великої літери.
+    Переноси «магі-» + «єю» склеюються в «магією»."""
+    els = []
+    set_w = max(set_right - set_left, 1.0)
+    gaps = [b["y0"] - a["y1"] for a, b in zip(lines, lines[1:])
+            if b["y0"] > a["y1"]]
+    med_gap = sorted(gaps)[len(gaps) // 2] if gaps else 4.0
+
+    def level(sz, text=""):
+        t = text.strip()
+        kw_h1 = (_H1_KW.match(t) and len(t) < 50
+                 and not re.search(r"[.!?]$", t))   # коротка назва, не речення
+        if kw_h1 or sz >= body_size * 1.9:
+            return "h1"
+        if sz >= body_size * 1.55:
+            return "h2"
+        if sz >= body_size * 1.28:
+            return "h3"
+        return "para"
+
+    cur, prev = None, None
+    for ln in lines:
+        k = level(ln["size"], ln["text"])
+        if cur is None or k != cur["kind"]:
+            new_par = True
+        elif k != "para":
+            # рядки заголовка зливаються; розрив лише на великому проміжку
+            new_par = prev is not None and ln["y0"] - prev["y1"] > med_gap * 2.5 + 1
+        else:
+            indent = (ln["x0"] - set_left > set_w * 0.03
+                      and prev is not None and ln["x0"] - prev["x0"] > 4)
+            vgap = (prev is not None
+                    and ln["y0"] - prev["y1"] > med_gap * 1.8 + 0.5)
+            prev_short = (prev is not None
+                          and (prev["x1"] - set_left) < set_w * 0.6
+                          and bool(re.match(r"[«\"(]?\s*[—–-]?\s*[А-ЯЁЇІЄҐA-Z\d]",
+                                            ln["text"])))
+            new_par = indent or vgap or prev_short
+        if new_par:
+            if cur:
+                els.append(cur)
+            cur = {"kind": k, "text": ln["text"], "y0": ln["y0"]}
+        else:
+            # склейка переносу: «магі-» + «єю» -> «магією»
+            if (re.search(r"[А-Яа-яЁёЇїІіЄєҐґA-Za-z]-$", cur["text"])
+                    and re.match(r"[а-яёїієґa-z]", ln["text"])):
+                cur["text"] = cur["text"][:-1] + ln["text"]
+            else:
+                cur["text"] += " " + ln["text"]
+        prev = ln
+    if cur:
+        els.append(cur)
+    return els
+
+
+def build_reflow_flow(pdf_bytes, ocr_lang="rus", skip_pages=None):
+    """Повний потік книги для reflow: [{kind, text|page|data, ...}].
+    kind: h1|h2|h3|para|image|pageimg. skip_pages — сторінки, що НЕ йдуть у
+    потік (обкладинка, старий титул). Повертає (flow, (W,H), title_page_no)."""
+    pages, fullpage, inflow, (W, H) = _reflow_extract(pdf_bytes, ocr_lang)
+    body = _reflow_body_size(pages)
+    pages = _reflow_artifacts(pages, H, body)
+    # старий титул: перша сторінка з текстом (без обкладинки) — його заміняє
+    # наш новий титульний лист
+    title_pno = next((i for i, p in enumerate(pages) if i > 0 and p), None)
+    skip = set(skip_pages or ())
+    skip.add(0)
+    if title_pno is not None:
+        skip.add(title_pno)
+    # сторінки старого змісту цілком геть (у книги буде свій новий зміст)
+    for i, p in enumerate(pages):
+        if p and _is_old_toc_page(p):
+            skip.add(i)
+
+    flow = []
+    for pno, plines in enumerate(pages):
+        if pno in skip:
+            continue
+        if pno in fullpage:
+            flow.append({"kind": "pageimg", "page": pno})
+            continue
+        if not plines:
+            continue
+        left = min(l["x0"] for l in plines)
+        right = max(l["x1"] for l in plines)
+        for el in _reflow_paragraphs(plines, body, left, right):
+            el["page"] = pno
+            flow.append(el)
+
+    # злиття абзацу через сторінку: попередній не завершений і новий з малої
+    merged = []
+    for el in flow:
+        if (merged and el["kind"] == "para"
+                and merged[-1]["kind"] == "para"
+                and el["page"] != merged[-1]["page"]
+                and not re.search(r"[.!?…:»\")]\s*$", merged[-1]["text"])
+                and re.match(r"[а-яёїієґa-z]", el["text"])):
+            a = merged[-1]
+            if (re.search(r"[А-Яа-яЁёЇїІіЄєҐґA-Za-z]-$", a["text"])
+                    and re.match(r"[а-яёїієґa-z]", el["text"])):
+                a["text"] = a["text"][:-1] + el["text"]
+            else:
+                a["text"] += " " + el["text"]
+        else:
+            merged.append(el)
+    flow = merged
+
+    # дрібні картинки в потік: після найближчого абзацу своєї сторінки
+    for img in sorted(inflow, key=lambda i: (i["page"], i["y"])):
+        idx = None
+        for k, el in enumerate(flow):
+            if el.get("page") == img["page"] and el.get("y0", 0) <= img["y"]:
+                idx = k
+        item = {"kind": "image", "data": img["data"],
+                "w": img["w"], "h": img["h"]}
+        flow.insert(idx + 1 if idx is not None else len(flow), item)
+    return flow, (W, H), title_pno
+
+
+def reflow_title_meta(pdf_bytes, api_key, glossary, src, dst, model):
+    """Назва й автори для нового титулу. Беремо ПЕРШУ ТЕКСТОВУ титульну
+    сторінку, ПРОПУСКАЮЧИ обкладинку (сторінку 0 — у скан-книг там сміттєвий
+    текст-шар на кшталт 'магия') і сторінки старого змісту. Найбільші за кеглем
+    блоки = назва, дрібніші короткі рядки = автори; перекладаємо їх напряму тим
+    самим движком/глосарієм. Помилки -> розумні заглушки."""
+    title_uk, authors_uk = "", []
+    try:
+        pages = _first_pages_blocks(pdf_bytes)
+        blk = []
+        for i, p in enumerate(pages):
+            if i == 0 or not p:                 # обкладинка / порожня
+                continue
+            if _is_old_toc_page(p):
+                continue
+            if sum(len(b["text"]) for b in p) >= 15:
+                blk = p
+                break
+        if blk:
+            mx = max(b["size"] for b in blk)
+            title_src = [b["text"] for b in blk
+                         if b["size"] >= mx * 0.7 and len(b["text"]) >= 2][:4]
+            author_src = [b["text"] for b in blk
+                          if b["size"] < mx * 0.7
+                          and 3 <= len(b["text"]) <= 60][:3]
+            src_all = title_src + author_src
+            if src_all:
+                tr = translate_blocks(src_all, api_key, provider="gemini",
+                                      model=model, src=src, dst=dst,
+                                      glossary=glossary, extra_sys=_ABBR_RULE)
+                n = len(title_src)
+                title_uk = " ".join(t.strip() for t in tr[:n] if t.strip())[:120]
+                authors_uk = [t.strip() for t in tr[n:] if t.strip()]
+    except Exception as e:
+        print("reflow title meta failed:", e)
+    return {"title_uk": title_uk or "Без назви", "authors_uk": authors_uk}
+
+
+def _reflow_heading_pages(body_doc, heads):
+    """Сторінка кожного заголовка в body: послідовний пошук тексту
+    (надійніше за element_positions across версій PyMuPDF)."""
+    out, start = [], 0
+    for lvl, text in heads:
+        needle = re.sub(r"\s+", " ", text.strip())[:40]
+        found = None
+        for pno in range(start, body_doc.page_count):
+            try:
+                if body_doc[pno].search_for(needle):
+                    found = pno
+                    break
+            except Exception:
+                break
+        if found is None:
+            found = start
+        out.append((lvl, text, found))
+        start = found
+    return out
+
+
+def build_pdf_reflow(pdf_bytes, flow, meta, cover_png=None,
+                     toc_title="Зміст", pagenum_label=None):
+    """Збирає ЧИСТУ книгу: [обкладинка][титул][зміст][тіло з номерами сторінок].
+    flow — елементи з ПЕРЕКЛАДЕНИМ текстом у ключі "uk" (без нього "text").
+    Розмір сторінки = оригінал; поля ~52pt боки / ~64pt верх-низ; тіло
+    DejaVu Serif 11.5/1.4 по ширині з абзацним відступом; заголовки DejaVu
+    Sans Bold; H1 з нової сторінки; зміст із РЕАЛЬНИМИ номерами сторінок
+    тіла (нумерація друкується з першої сторінки тіла)."""
+    import html as _html
+
+    src = fitz.open(stream=pdf_bytes, filetype="pdf")
+    W, H = src[0].rect.width, src[0].rect.height
+    ML = MR = 52.0
+    MT, MB = 64.0, 64.0
+    rect = fitz.Rect(ML, MT, W - MR, H - MB)
+
+    arch, face_css = _font_assets()
+    if arch is None:
+        src.close()
+        raise RuntimeError("DejaVu не знайдено: reflow потребує шрифтів")
+    css = (face_css +
+           "body{font-family:'BookSerif',serif;font-size:11.5px;"
+           "line-height:1.4;text-align:justify;}"
+           "p{margin:0;text-indent:18px;}"
+           "p.noind{text-indent:0;}"
+           "h1,h2,h3{font-family:'BookSans',sans-serif;font-weight:bold;"
+           "line-height:1.25;text-align:left;}"
+           "h1{font-size:21px;text-align:center;margin:96px 0 24px 0;}"
+           "h2{font-size:15.5px;margin:20px 0 9px 0;}"
+           "h3{font-size:12.5px;margin:13px 0 6px 0;}"
+           "img{margin:9px 0;}")
+
+    # сегменти: новий сегмент на h1 (свіжа сторінка) і на pageimg
+    segments, cur = [], []
+    for el in flow:
+        if el["kind"] == "pageimg":
+            if cur:
+                segments.append(("story", cur))
+                cur = []
+            segments.append(("pageimg", el))
+        elif el["kind"] == "h1" and cur:
+            segments.append(("story", cur))
+            cur = [el]
+        else:
+            cur.append(el)
+    if cur:
+        segments.append(("story", cur))
+
+    body = fitz.open()
+    heads = []                      # (lvl, text) у порядку появи
+    img_n = 0
+    set_w = W - ML - MR
+    for kind, seg in segments:
+        if kind == "pageimg":
+            pg = body.new_page(width=W, height=H)
+            pix = src[seg["page"]].get_pixmap(matrix=fitz.Matrix(2, 2))
+            pg.insert_image(pg.rect, stream=pix.tobytes("png"))
+            continue
+        parts, after_head = [], False
+        for el in seg:
+            if el["kind"] == "image":
+                img_n += 1
+                name = f"reflowimg{img_n}.png"
+                arch.add(el["data"], name)
+                iw = min(set_w, max(40.0, float(el["w"])))
+                ih = iw * (float(el["h"]) / max(float(el["w"]), 1.0))
+                parts.append(f'<img src="{name}" width="{iw:.0f}" '
+                             f'height="{ih:.0f}">')
+                continue
+            txt = _html.escape((el.get("uk") or el.get("text") or "").strip())
+            if not txt:
+                continue
+            if el["kind"] in ("h1", "h2", "h3"):
+                heads.append((int(el["kind"][1]), el.get("uk") or el["text"]))
+                parts.append(f"<{el['kind']}>{txt}</{el['kind']}>")
+                after_head = True
+            else:
+                cls = ' class="noind"' if after_head else ""
+                parts.append(f"<p{cls}>{txt}</p>")
+                after_head = False
+        if not parts:
+            continue
+        story = fitz.Story(html="<body>" + "".join(parts) + "</body>",
+                           user_css=css, archive=arch)
+        buf = io.BytesIO()
+        wr = fitz.DocumentWriter(buf)
+        while True:
+            dev = wr.begin_page(fitz.Rect(0, 0, W, H))
+            more, _f = story.place(rect)
+            story.draw(dev)
+            wr.end_page()
+            if not more:
+                break
+        wr.close()
+        body.insert_pdf(fitz.open("pdf", buf.getvalue()))
+
+    if body.page_count == 0:
+        src.close()
+        raise ValueError("reflow: порожнє тіло книги (не знайдено тексту)")
+
+    # номери сторінок тіла: знизу по центру, з 1
+    serif = _FONTS[("serif", False, False)]
+    for i in range(body.page_count):
+        body[i].insert_textbox(fitz.Rect(0, H - MB + 16, W, H - MB + 34),
+                               str(i + 1), fontsize=9, fontname="pgn",
+                               fontfile=serif, align=1)
+
+    toc_entries = _reflow_heading_pages(body, [h for h in heads
+                                               if h[0] in (1, 2)])
+
+    out = fitz.open()
+    f_serif = fitz.Font(fontfile=serif)
+    f_sans_b = fitz.Font(fontfile=_FONTS[("sans", True, False)])
+
+    def center_text(page, y, text, font, fsize, fname, ffile):
+        tl = font.text_length(text, fontsize=fsize)
+        page.insert_text((max(ML, (W - tl) / 2), y), text, fontsize=fsize,
+                         fontname=fname, fontfile=ffile)
+
+    # --- обкладинка
+    if cover_png:
+        pg = out.new_page(width=W, height=H)
+        try:
+            pg.insert_image(pg.rect, stream=cover_png)
+        except Exception:
+            out.delete_page(0)
+
+    # --- титул: автори дрібно, назва великим Sans Bold, акцентна лінія
+    pg = out.new_page(width=W, height=H)
+    y = H * 0.20
+    for a in meta.get("authors_uk", [])[:3]:
+        center_text(pg, y, a, f_serif, 11.5, "tser", serif)
+        y += 16
+    ty = max(H * 0.40, y + 30)
+    tsize = 24.0
+    words = (meta.get("title_uk") or "Без назви").split()
+    lines, cur = [], ""
+    while tsize >= 14:
+        lines, cur = [], ""
+        for wd in words:
+            t = (cur + " " + wd).strip()
+            if f_sans_b.text_length(t, fontsize=tsize) <= W - 2 * ML or not cur:
+                cur = t
+            else:
+                lines.append(cur)
+                cur = wd
+        if cur:
+            lines.append(cur)
+        if all(f_sans_b.text_length(l, fontsize=tsize) <= W - 2 * ML
+               for l in lines) and len(lines) <= 4:
+            break
+        tsize -= 2
+    for l in lines:
+        center_text(pg, ty, l, f_sans_b, tsize,
+                    "tsanb", _FONTS[("sans", True, False)])
+        ty += tsize * 1.25
+    pg.draw_rect(fitz.Rect(W * 0.40, ty + 10, W * 0.60, ty + 13),
+                 color=None, fill=(0.15, 0.15, 0.15))
+
+    # --- зміст: H1/H2 з реальними номерами сторінок тіла
+    if toc_entries:
+        pg = out.new_page(width=W, height=H)
+        center_text(pg, MT + 24, toc_title, f_sans_b, 16,
+                    "tsanb", _FONTS[("sans", True, False)])
+        y = MT + 60
+        dotw = f_serif.text_length(".", fontsize=11.5)
+        for lvl, text, pno in toc_entries:
+            if y > H - MB - 10:
+                pg = out.new_page(width=W, height=H)
+                y = MT + 20
+            t = re.sub(r"\s+", " ", text.strip())[:90]
+            num = str(pno + 1)
+            indent = 0 if lvl == 1 else 16
+            font = f_sans_b if lvl == 1 else f_serif
+            fname, ffile = (("tsanb", _FONTS[("sans", True, False)])
+                            if lvl == 1 else ("tser", serif))
+            tw = font.text_length(t, fontsize=11.5)
+            nw = f_serif.text_length(num, fontsize=11.5)
+            avail = (W - MR) - (ML + indent) - tw - nw - 8
+            dots = " " + "." * max(0, int(avail / max(dotw, 0.1))) if avail > dotw * 3 else " "
+            pg.insert_text((ML + indent, y), t, fontsize=11.5,
+                           fontname=fname, fontfile=ffile)
+            pg.insert_text((ML + indent + tw, y), dots, fontsize=11.5,
+                           fontname="tser", fontfile=serif)
+            pg.insert_text((W - MR - nw, y), num, fontsize=11.5,
+                           fontname="tser", fontfile=serif)
+            y += 18 if lvl == 1 else 16
+
+    out.insert_pdf(body)
+    out.set_metadata({"title": meta.get("title_uk", ""),
+                      "author": ", ".join(meta.get("authors_uk", []))})
+    res = out.tobytes(deflate=True, garbage=4)
+    out.close()
+    body.close()
+    src.close()
+    return res
