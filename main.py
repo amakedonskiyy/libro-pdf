@@ -72,7 +72,7 @@ def supa_upload_result(path, pdf_bytes):
     return SUPA_URL + "/storage/v1" + r.json()["signedURL"]
 
 
-ENGINE_VERSION = "2026-06-13-reflow-v1"
+ENGINE_VERSION = "2026-06-13-reflow-v2"
 
 
 def _safe_err(e, limit=200):
@@ -173,11 +173,16 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
             if not tidx:
                 raise RuntimeError("reflow: у книзі не знайдено тексту "
                                    "(справжній скан без OCR-шару?)")
+            # биті блоки (битий cmap, OCR-рятунок не допоміг) у переклад НЕ
+            # шлемо: build_pdf_reflow їх однаково відкине (правило 4). Так не
+            # палимо токени на кашу і не даємо LLM щось «вигадати» з неї.
+            good = [i for i in tidx if not flow[i].get("garbled")]
+            ng = len(tidx) - len(good)
             nimg = sum(1 for el in flow if el["kind"] == "image")
             npimg = sum(1 for el in flow if el["kind"] == "pageimg")
-            log(f"reflow: text elements={len(tidx)}, inflow images={nimg}, "
-                f"full-page images={npimg}")
-            texts = [flow[i]["text"] for i in tidx]
+            log(f"reflow: text elements={len(tidx)} (битих відкинуто={ng}), "
+                f"inflow images={nimg}, full-page images={npimg}")
+            texts = [flow[i]["text"] for i in good]
             log("building glossary (term consistency)...")
             glossary = P.build_glossary(texts, api_key, provider=provider,
                                         model=model or None, src=src, dst=dst)
@@ -189,13 +194,13 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
                     return re.sub(r"[\s\-­]+", "", t or "").lower()
                 rmap = {_norm(o): u for o, u in reuse_tr.items()
                         if (o or "").strip() and (u or "").strip()}
-                for i in tidx:
+                for i in good:
                     u = rmap.get(_norm(flow[i]["text"]))
                     if u:
                         flow[i]["uk"] = u
                         pre[i] = True
-                log(f"reflow: reuse {len(pre)}/{len(tidx)} перекладів")
-            need = [i for i in tidx if i not in pre]
+                log(f"reflow: reuse {len(pre)}/{len(good)} перекладів")
+            need = [i for i in good if i not in pre]
             if need:
                 log(f"translate_blocks: {len(need)} elements...")
                 tr = P.translate_blocks([flow[i]["text"] for i in need],
@@ -214,7 +219,7 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
             log("build_pdf_reflow...")
             out = P.build_pdf_reflow(pdf_bytes, flow, meta, cover_png=cover_png)
             JOBS[job_id]["src_texts"] = {flow[i]["text"]: flow[i].get("uk", "")
-                                         for i in tidx}
+                                         for i in good}
             log(f"done: {len(out)//1024}KB")
             path = os.path.join(JOB_DIR, f"{job_id}.pdf")
             with open(path, "wb") as f:

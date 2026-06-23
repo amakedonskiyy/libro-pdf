@@ -1948,6 +1948,14 @@ def _reflow_extract(pdf_bytes, ocr_lang="rus"):
                     continue
                 szs = [s["size"] for s in ln["spans"] if s["text"].strip()]
                 x0, y0, x1, y1 = ln["bbox"]
+                # битий cmap у текстовому шарі (як у preserve extract_blocks):
+                # рятуємо рядок OCR-ом з пікселів. Не врятували -> лишаємо як є;
+                # element-level guard у build_pdf_reflow його не поставить
+                # (правило 4). _looks_garbled НЕ чіпаємо (правило 3).
+                if _looks_garbled(txt):
+                    fixed = _ocr_region(page, (x0, y0, x1, y1), ocr_lang)
+                    if fixed and not _looks_garbled(fixed):
+                        txt = fixed
                 lines.append({"text": txt, "x0": x0, "x1": x1, "y0": y0,
                               "y1": y1, "size": max(szs) if szs else y1 - y0})
         nch = sum(len(l["text"]) for l in lines)
@@ -2152,6 +2160,13 @@ def build_reflow_flow(pdf_bytes, ocr_lang="rus", skip_pages=None):
             merged.append(el)
     flow = merged
 
+    # позначка битого блоку (після злиття абзаців): рядкове OCR-рятування вже
+    # відпрацювало в _reflow_extract; те, що лишилось битим, не піде ні в
+    # переклад, ні в книгу (правило 4)
+    for el in flow:
+        if el["kind"] in ("h1", "h2", "h3", "para"):
+            el["garbled"] = _looks_garbled(el.get("text", ""))
+
     # дрібні картинки в потік: після найближчого абзацу своєї сторінки
     for img in sorted(inflow, key=lambda i: (i["page"], i["y"])):
         idx = None
@@ -2292,9 +2307,16 @@ def build_pdf_reflow(pdf_bytes, flow, meta, cover_png=None,
                 parts.append(f'<img src="{name}" width="{iw:.0f}" '
                              f'height="{ih:.0f}">')
                 continue
-            txt = _html.escape((el.get("uk") or el.get("text") or "").strip())
-            if not txt:
+            raw = (el.get("uk") or el.get("text") or "").strip()
+            if not raw:
                 continue
+            # ПОДВІЙНА ЗАХИСТ (правило 4, як у build_pdf): блок не ставимо,
+            # якщо битий ОРИГІНАЛ або битий ПЕРЕКЛАД. el["garbled"] ловить і
+            # ту кашу, що _looks_garbled пропускає (її виставили на джерелі).
+            if (el.get("garbled") or _looks_garbled(el.get("text", ""))
+                    or _looks_garbled(raw)):
+                continue
+            txt = _html.escape(raw)
             if el["kind"] in ("h1", "h2", "h3"):
                 heads.append((int(el["kind"][1]), el.get("uk") or el["text"]))
                 parts.append(f"<{el['kind']}>{txt}</{el['kind']}>")

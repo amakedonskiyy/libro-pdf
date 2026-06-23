@@ -303,10 +303,43 @@ def check_reflow_paragraphs():
         fail("reflow: обычная страница ложно принята за оглавление")
 
 
+def check_reflow_garble_guard():
+    """build_pdf_reflow — двойная защита (правило 4): блок не ставится, если
+    бит ИСХОДНИК или бит ПЕРЕВОД. _looks_garbled НЕ трогаем (правило 3)."""
+    doc = fitz.open()
+    doc.new_page(width=400, height=600)
+    buf = io.BytesIO()
+    doc.save(buf)
+    doc.close()
+    flow = [
+        {"kind": "para", "text": "Чистий вихідний абзац книги.",
+         "uk": "ЧИСТОТАМАРКЕР переклад абзацу українською мовою тут."},
+        # бит ИСХОДНИК c флагом garbled (как ставит build_reflow_flow). Профиль
+        # «M8/» _looks_garbled НЕ ловит — держит именно флаг (авто-флаг этого
+        # профиля — в бэклоге; здесь проверяем сам guard «флаг -> не ставить»).
+        {"kind": "para", "text": "M8/ 15-г/ п79;с8/:)J98",
+         "uk": "M8/ 15-г/ п79;с8/:)J98", "garbled": True},
+        # бит ПЕРЕВОД (digit-style, его _looks_garbled ловит), исходник чистый
+        {"kind": "para", "text": "звичайний оригінал",
+         "uk": "(ба1М1еаг1ес1пезз) КАШАМАРКЕР"},
+    ]
+    out = P.build_pdf_reflow(buf.getvalue(), flow,
+                            {"title_uk": "Тест", "authors_uk": []},
+                            cover_png=None)
+    txt = "".join(p.get_text() for p in fitz.open(stream=out, filetype="pdf"))
+    if "ЧИСТОТАМАРКЕР" not in txt:
+        fail("reflow guard: чистый блок пропал из книги")
+    if "п79" in txt:
+        fail("reflow guard: блок с garbled-флагом (M8/...) не отброшен")
+    if "КАШАМАРКЕР" in txt or "ба1М1" in txt:
+        fail("reflow guard: блок с битым переводом не отброшен")
+
+
 def main():
     check_garbled_calibration()
     check_cover_truth_correction()
     check_reflow_paragraphs()
+    check_reflow_garble_guard()
     make_sample()
     with open(SAMPLE, "rb") as f:
         pdf_bytes = f.read()
