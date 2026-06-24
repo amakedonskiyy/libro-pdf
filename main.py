@@ -17,6 +17,7 @@ import os
 import io
 import re
 import time
+import json
 import uuid
 import queue
 import hashlib
@@ -76,7 +77,7 @@ def supa_upload_result(path, pdf_bytes):
     return SUPA_URL + "/storage/v1" + r.json()["signedURL"]
 
 
-ENGINE_VERSION = "2026-06-24-quality-flag-v1"
+ENGINE_VERSION = "2026-06-24-resume-v1"
 
 # --- захист від зависань: потолок часу + детект «немає прогресу» ---
 # (переоприділяється env-змінними; у тестах ставимо малі значення)
@@ -93,6 +94,103 @@ MAX_PARALLEL_JOBS = max(1, int(os.environ.get("MAX_PARALLEL_JOBS", 2)))
 
 # --- Уровень 2: порог доли «подозрительных на кашу» строк для флага качества ---
 QUALITY_GARBLE_PCT = float(os.environ.get("QUALITY_GARBLE_PCT", 5.0))
+
+# --- чекпойнт/resume: добивать книгу за несколько подходов несмотря на 503 ---
+AUTO_RESUME_MAX = int(os.environ.get("AUTO_RESUME_MAX", 2))      # 0 = только вручную
+AUTO_RESUME_DELAY = float(os.environ.get("AUTO_RESUME_DELAY", 90))  # пауза перед авто-resume
+
+
+def _ckpt_path(job_id):
+    return os.path.join(JOB_DIR, f"{job_id}.ckpt.json")
+
+
+def _ckpt_load(job_id):
+    """{str(block_id): перевод} уже готовых блоков (состояние resume)."""
+    try:
+        with open(_ckpt_path(job_id), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _ckpt_save(job_id, data):
+    """Атомарно (tmp+rename), чтобы обрыв во время записи не бил чекпойнт."""
+    try:
+        p = _ckpt_path(job_id)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, p)
+    except Exception as e:
+        print(f"ckpt save failed: {e}")
+
+
+def _ckpt_clear(job_id):
+    for ext in (".ckpt.json", ".ckpt.json.tmp"):
+        try:
+            os.remove(os.path.join(JOB_DIR, f"{job_id}{ext}"))
+        except Exception:
+            pass
+
+
+def _translate_with_ckpt(job_id, ids, texts, api_key, provider, model, src, dst,
+                         proofread, glossary, abort_cb):
+    """Перевод texts (с глобальными id) с ЧЕКПОЙНТОМ: после каждого батча
+    готовое сохраняется на диск по job_id. При обрыве (503-шторм -> timeout)
+    уже переведённое НЕ теряется; resume перезапускает _run_local_job, ckpt-
+    файл подхватывается и переводится только остаток. Возвращает {id: перевод}
+    для ВСЕХ (готовые из чекпойнта + новые). Перевод-логику не меняет."""
+    ckpt = _ckpt_load(job_id)                          # {str(id): перевод}
+    total = len(ids)
+    JOBS[job_id]["total"] = total
+    need = [k for k in range(total) if str(ids[k]) not in ckpt]
+    JOBS[job_id]["translated"] = total - len(need)
+    if need:
+        need_ids = [str(ids[k]) for k in need]
+        need_texts = [texts[k] for k in need]
+        base = len(ckpt)
+
+        def prog(done, _tw):
+            JOBS[job_id]["last_progress"] = time.time()   # watchdog: прогресс есть
+            n = min(total, base + done)
+            JOBS[job_id]["progress"] = max(1, min(99, int(n / max(total, 1) * 99)))
+
+        def ckpt_cb(localmap):                            # {local_idx: перевод}
+            for li, tr in localmap.items():
+                ckpt[need_ids[li]] = tr
+            _ckpt_save(job_id, ckpt)
+            JOBS[job_id]["translated"] = len(ckpt)
+
+        new = P.translate_blocks(need_texts, api_key, provider=provider,
+                                 model=model or None, src=src, dst=dst,
+                                 proofread=proofread, progress_cb=prog,
+                                 glossary=glossary, abort_cb=abort_cb,
+                                 checkpoint_cb=ckpt_cb)
+        for li, tr in enumerate(new):
+            ckpt[need_ids[li]] = tr
+        _ckpt_save(job_id, ckpt)
+        JOBS[job_id]["translated"] = len(ckpt)
+    return {ids[k]: ckpt.get(str(ids[k]), texts[k]) for k in range(total)}
+
+
+def _maybe_auto_resume(job_id):
+    """Опционально: после stalled — авто-resume до AUTO_RESUME_MAX раз с паузой
+    (даём 503-шторму утихнуть). Ключ берём из памяти задачи (в ответах API он
+    отфильтрован, правило 10). 0 -> только ручной resume."""
+    if AUTO_RESUME_MAX <= 0:
+        return
+    j = JOBS.get(job_id) or {}
+    if j.get("resume_attempts", 0) >= AUTO_RESUME_MAX or not j.get("_api_key"):
+        return
+    def later():
+        time.sleep(AUTO_RESUME_DELAY)
+        jj = JOBS.get(job_id)
+        if not jj or jj.get("status") != "stalled":
+            return                                  # уже возобновили вручную / готово
+        jj["resume_attempts"] = jj.get("resume_attempts", 0) + 1
+        print(f"[job {job_id}] auto-resume #{jj['resume_attempts']}", flush=True)
+        _resume_enqueue(job_id, jj["_api_key"], jj.get("params", {}).get("model", ""))
+    threading.Thread(target=later, daemon=True).start()
 
 
 def _attach_quality(job_id, out):
@@ -298,6 +396,8 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
         now = time.time()
         JOBS[job_id].update(status="processing", progress=1,
                             started=now, last_progress=now)
+        if AUTO_RESUME_MAX > 0:               # ключ у пам'яті лише для авто-resume
+            JOBS[job_id]["_api_key"] = api_key  # (відфільтрований з усіх відповідей API)
         _start_watchdog(job_id)
         log(f"start [{ENGINE_VERSION}]: {len(pdf_bytes)//1024}KB, provider={provider}, model={model!r}, src={src}, vision={vision}, cover_vision={cover_vision}, layout={layout_mode}")
 
@@ -354,14 +454,15 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
                 log(f"reflow: reuse {len(pre)}/{len(good)} перекладів")
             need = [i for i in good if i not in pre]
             if need:
-                log(f"translate_blocks: {len(need)} elements...")
-                tr = P.translate_blocks([flow[i]["text"] for i in need],
-                                        api_key, provider=provider,
-                                        model=model or None, src=src, dst=dst,
-                                        proofread=proofread, progress_cb=cb,
-                                        glossary=glossary, abort_cb=abort_cb)
-                for k, i in enumerate(need):
-                    flow[i]["uk"] = tr[k]
+                ck0 = len(_ckpt_load(job_id))
+                log(f"translate_blocks: {len(need)} elements "
+                    f"({ck0} из чекпойнта, перевожу остаток)...")
+                rmap = _translate_with_ckpt(job_id, need,
+                                            [flow[i]["text"] for i in need],
+                                            api_key, provider, model, src, dst,
+                                            proofread, glossary, abort_cb)
+                for i in need:
+                    flow[i]["uk"] = rmap[i]
             log("reflow: title page meta...")
             meta = P.reflow_title_meta(pdf_bytes, api_key, glossary, src, dst,
                                        model or None)
@@ -380,6 +481,7 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
             with open(path, "wb") as f:
                 f.write(out)
             JOBS[job_id].update(status="done", progress=100, path=path)
+            _ckpt_clear(job_id)               # книга готова -> чекпойнт не нужен
             return
 
         recipe = {}
@@ -416,18 +518,20 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
                                         provider=provider, model=model or None,
                                         src=src, dst=dst)
             log(f"glossary: {len(glossary)} terms")
-            log(f"translate_blocks: {len(flat)} blocks...")
-            tr = P.translate_blocks([t for _, t in flat], api_key, provider=provider,
-                                    model=model or None, src=src, dst=dst,
-                                    proofread=proofread, progress_cb=cb,
-                                    glossary=glossary, abort_cb=abort_cb)
+            ids = [bid for bid, _ in flat]
+            texts = [t for _, t in flat]
+            ck0 = len(_ckpt_load(job_id))
+            log(f"translate_blocks: {len(flat)} blocks "
+                f"({ck0} из чекпойнта, перевожу остаток)...")
+            tmap = _translate_with_ckpt(job_id, ids, texts, api_key, provider,
+                                        model, src, dst, proofread, glossary,
+                                        abort_cb)
             abort_cb()                        # не будувати скасований PDF
             log("build_pdf...")
-            tmap = {flat[i][0]: tr[i] for i in range(len(flat))}
             # переклади лишаються в пам'яті процесу: /jobs/{id}/rebuild
             # перевикористає їх і не палитиме API вдруге
-            JOBS[job_id]["src_texts"] = {flat[i][1]: tr[i]
-                                         for i in range(len(flat))}
+            JOBS[job_id]["src_texts"] = {texts[i]: tmap[ids[i]]
+                                         for i in range(len(ids))}
             out = P.build_pdf(pdf_bytes, pages, tmap, recipe=recipe)
             # ОБКЛАДИНКА: якщо 1-ша сторінка — суцільна картинка (0 текстових
             # блоків), на текстовому шляху вона лишилась би мовою оригіналу.
@@ -494,10 +598,23 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
         with open(path, "wb") as f:
             f.write(out)
         JOBS[job_id].update(status="done", progress=100, path=path)
+        _ckpt_clear(job_id)                   # книга готова -> чекпойнт не нужен
     except P._Aborted as ab:
         log(f"ABORTED [{ab.status}]: {ab.msg}")
-        JOBS[job_id].update(status=ab.status,
-                            error=ab.msg or ab.status, progress=0)
+        if ab.status == "cancelled":          # юзер відмінив -> прогрес не тримаємо
+            _ckpt_clear(job_id)
+            JOBS[job_id].update(status="cancelled", error=ab.msg, progress=0)
+        else:                                 # timeout (503-шторм)
+            ck = _ckpt_load(job_id)
+            if ck:                            # є прогрес -> STALLED, не губимо
+                JOBS[job_id].update(
+                    status="stalled", translated=len(ck),
+                    error="503-шторм: переклад призупинено, прогрес збережено — "
+                          "виклич POST /jobs/{id}/resume пізніше")
+                log(f"STALLED: {len(ck)} блоків збережено; resume дотисне лишок")
+                _maybe_auto_resume(job_id)
+            else:
+                JOBS[job_id].update(status="timeout", error=ab.msg, progress=0)
     except Exception as e:
         traceback.print_exc()
         log(f"ERROR: {_safe_err(e)}")
@@ -539,7 +656,10 @@ async def create_job(file: UploadFile = File(...), api_key: str = Form(...),
                     "file_hash": file_hash,
                     "params": {"provider": provider, "model": model, "src": src,
                                "dst": dst, "proofread": proofread,
-                               "layout_mode": layout_mode}}
+                               "layout_mode": layout_mode, "cover_vision": cover_vision,
+                               "cover_mode": cover_mode, "vision": vision,
+                               "vision_model": vision_model}}
+    _ckpt_clear(job_id)                       # свіжий job -> жодного старого чекпойнту
     # вихідник на диск: /jobs/{id}/rebuild читає його звідси (і після рестарту)
     try:
         with open(os.path.join(JOB_DIR, f"{job_id}.src.pdf"), "wb") as f:
@@ -598,6 +718,55 @@ async def rebuild_job(job_id: str,
     }, status_code=202)
 
 
+def _resume_enqueue(job_id, api_key, model_override=""):
+    """Перезапуск _run_local_job для ТОГО Ж job_id: чекпойнт на диску
+    подхватится сам, переведётся только остаток. Источник — сохранённый
+    {job_id}.src.pdf, параметры — из JOBS[job_id]['params']."""
+    j = JOBS.get(job_id) or {}
+    src_path = os.path.join(JOB_DIR, f"{job_id}.src.pdf")
+    if not os.path.exists(src_path):
+        return False
+    with open(src_path, "rb") as f:
+        pdf_bytes = f.read()
+    p = j.get("params", {})
+    j["status"] = "queued"
+    j["cancel"] = False
+    j.pop("abort_reason", None)
+    _enqueue_job(job_id, pdf_bytes, api_key, p.get("provider", "gemini"),
+                 model_override or p.get("model", ""), p.get("src", "ru"),
+                 p.get("dst", "uk"), p.get("proofread", False), j.get("name"),
+                 p.get("vision", False), p.get("vision_model", ""),
+                 p.get("cover_vision", False), p.get("layout_mode", "preserve"),
+                 p.get("cover_mode", ""))
+    return True
+
+
+@app.post("/jobs/{job_id}/resume")
+def resume_job(job_id: str, api_key: str = Form(...), model: str = Form("")):
+    """Продовжити перерваний (stalled/timeout/error) переклад з ПЕРШОГО
+    неперекладеного блоку. Уже перекладене лежить у чекпойнті на диску — API
+    на нього вдруге НЕ палиться. Якщо Gemini ще в 503 — знову stalled, прогрес
+    знову збережено, можна дёрнути resume пізніше. Відповідь — як у POST /jobs."""
+    j = JOBS.get(job_id)
+    if not j:
+        return JSONResponse({"status": "unknown"}, status_code=404)
+    if j.get("status") in ("queued", "processing", "cancelling"):
+        return {"status": j["status"], "note": "вже виконується"}
+    if j.get("status") == "done":
+        return {"status": "done", "note": "вже готово"}
+    if not os.path.exists(os.path.join(JOB_DIR, f"{job_id}.src.pdf")):
+        raise HTTPException(404, "вихідний PDF не знайдено (диск очищено) — "
+                                 "завантаж книгу заново через POST /jobs")
+    j["resume_attempts"] = 0                  # ручной resume сбрасывает авто-счётчик
+    if not _resume_enqueue(job_id, api_key, model):
+        raise HTTPException(404, "не вдалося відновити — завантаж книгу заново")
+    return JSONResponse({
+        "job_id": job_id, "status_url": f"/jobs/{job_id}",
+        "download_url": f"/jobs/{job_id}/download", "resumed": True,
+        "translated": j.get("translated", 0), "total": j.get("total", 0),
+    }, status_code=202)
+
+
 @app.post("/jobs/{job_id}/cancel")
 def cancel_job(job_id: str):
     """Скасувати задачу: воркер припиняє обробку і перестає палити API на
@@ -639,7 +808,8 @@ def job_status(job_id: str):
         return JSONResponse({"status": "unknown"}, status_code=404)
     return {k: v for k, v in j.items()
             if k not in ("path", "src_texts", "params", "file_hash",
-                         "started", "last_progress", "cancel", "abort_reason")}
+                         "started", "last_progress", "cancel", "abort_reason",
+                         "_api_key")}
 
 
 @app.get("/jobs/{job_id}/download")

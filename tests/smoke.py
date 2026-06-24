@@ -578,6 +578,54 @@ def check_quality_scan():
         fail(f"quality: чистый PDF ложно помечен: {qg}")
 
 
+def check_resume_checkpoint():
+    """Чекпойнт+resume (без сети): обрыв в середине -> прогресс сохранён на
+    диск; resume переводит ТОЛЬКО остаток (готовое из API повторно не жжёт)."""
+    import main as M
+    jid = "smokeResume01"
+    M._ckpt_clear(jid)
+    M.JOBS[jid] = {"status": "processing", "progress": 0}
+    ids = list(range(6))
+    texts = [f"Блок номер {i}. " * 220 for i in range(6)]   # >2500 -> 1 на батч
+    calls = [0]
+    def mock(provider, api_key, model, system, user):
+        calls[0] += 1
+        return "переклад"                     # 1 сегмент == батч из 1 блока
+    orig = P._llm_call
+    P._llm_call = mock
+
+    def abort_after_3():
+        if M.JOBS[jid].get("translated", 0) >= 3:
+            raise P._Aborted("timeout", "503-шторм")
+    try:
+        # 1) прогон обрывается после ~3 блоков
+        aborted = False
+        try:
+            M._translate_with_ckpt(jid, ids, texts, "k", "gemini", "", "ru", "uk",
+                                   False, {}, abort_after_3)
+        except P._Aborted:
+            aborted = True
+        if not aborted:
+            fail("resume: обрыв не сработал")
+        ck = M._ckpt_load(jid)
+        if not (0 < len(ck) < 6):
+            fail(f"resume: чекпойнт не сохранил частичный прогресс: {len(ck)}")
+        calls_after1 = calls[0]
+        # 2) resume: переводит только остаток, готовое не трогает
+        full = M._translate_with_ckpt(jid, ids, texts, "k", "gemini", "", "ru", "uk",
+                                     False, {}, None)
+        if len(full) != 6 or any(full[i] is None for i in ids):
+            fail(f"resume: не дожал все блоки: {full}")
+        if calls[0] != 6:
+            fail(f"resume: повторно жёг API на готовом (вызовов {calls[0]} вместо 6)")
+        if calls[0] - calls_after1 != 6 - len(ck):
+            fail("resume: число вызовов на остатке не совпало")
+    finally:
+        P._llm_call = orig
+        M._ckpt_clear(jid)
+        M.JOBS.pop(jid, None)
+
+
 def main():
     check_garbled_calibration()
     check_cover_truth_correction()
@@ -589,6 +637,7 @@ def main():
     check_worker_pool()
     check_vision_retry()
     check_quality_scan()
+    check_resume_checkpoint()
     make_sample()
     with open(SAMPLE, "rb") as f:
         pdf_bytes = f.read()

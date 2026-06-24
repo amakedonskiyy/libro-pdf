@@ -403,7 +403,8 @@ def _make_batches(items_len, length_of, char_budget):
 
 def translate_blocks(texts, api_key, provider="gemini", model=None,
                      src="ru", dst="uk", char_budget=2500, proofread=False,
-                     progress_cb=None, glossary=None, extra_sys="", abort_cb=None):
+                     progress_cb=None, glossary=None, extra_sys="", abort_cb=None,
+                     checkpoint_cb=None):
     """
     Перекладає список рядків. Батчить, перевіряє кількість сегментів,
     fallback по одному. Якщо proofread=True — другий прохід-редактор.
@@ -412,6 +413,10 @@ def translate_blocks(texts, api_key, provider="gemini", model=None,
     для обкладинок). Прогрес рахується на обидві фази (переклад + редактор).
     abort_cb — викликається на початку кожного батчу; якщо кидає _Aborted
     (cancel/timeout), переклад негайно припиняється і API більше не палиться.
+    checkpoint_cb — після КОЖНОГО батчу отримує {локальний_індекс: переклад}
+    готових рядків цього батчу; оркестрація зберігає чекпойнт, щоб при обриві
+    (503-шторм -> timeout) уже перекладене не губилось і resume дотиснув
+    лишок. НЕ змінює логіку перекладу.
     """
     model = model or _default_model(provider)
     system = _SYS_PROMPT.format(src=_LANG.get(src, src), dst=_LANG.get(dst, dst))
@@ -463,6 +468,8 @@ def translate_blocks(texts, api_key, provider="gemini", model=None,
                     print("single error:", e)
                     out[idx] = texts[idx]
         report(len(batch))
+        if checkpoint_cb:                    # зберегти готові цього батчу
+            checkpoint_cb({i: out[i] for i in batch if out[i] is not None})
         time.sleep(0.2)
 
     if proofread:
