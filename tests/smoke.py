@@ -388,6 +388,63 @@ def check_inpaint_letters():
         fail("inpaint: тронул картинку без регионов")
 
 
+def check_job_guards():
+    """Защиты от зависших/лишних задач (без сети): abort_cb прерывает
+    translate_blocks; ping ловит мёртвый ключ; дубль по файлу не плодится."""
+    import main as M
+    orig = P._llm_call
+
+    # 1. abort_cb прерывает translate_blocks на границе батча
+    calls = [0]
+    def mock_llm(provider, api_key, model, system, user):
+        calls[0] += 1
+        return "переклад"
+    P._llm_call = mock_llm
+    try:
+        texts = [f"Текст блоку номер {i}, достатньо довгий, щоб батчі билися " * 2
+                 for i in range(40)]
+        def abort_after_first():
+            if calls[0] >= 1:
+                raise P._Aborted("cancelled", "stop")
+        raised = False
+        try:
+            P.translate_blocks(texts, "k", abort_cb=abort_after_first)
+        except P._Aborted as ab:
+            raised = (ab.status == "cancelled")
+        if not raised:
+            fail("abort_cb не прервал translate_blocks")
+    finally:
+        P._llm_call = orig
+
+    # 2. _ping_provider: _ClientError (мёртвый ключ) -> текст; иначе None
+    P._llm_call = lambda *a, **k: (_ for _ in ()).throw(P._ClientError("Gemini 401: bad key"))
+    try:
+        if not M._ping_provider("bad", "gemini", ""):
+            fail("ping не сигналит мёртвый ключ")
+    finally:
+        P._llm_call = orig
+    P._llm_call = lambda *a, **k: "ok"
+    try:
+        if M._ping_provider("good", "gemini", "") is not None:
+            fail("ping ложно сигналит при живом ключе")
+    finally:
+        P._llm_call = orig
+
+    # 3. защита от дублей по хешу файла + режиму
+    M.JOBS["smokeDup"] = {"status": "processing", "file_hash": "HASH1",
+                          "params": {"layout_mode": "preserve"}}
+    try:
+        if M._find_active_job("HASH1", "preserve") != "smokeDup":
+            fail("дубль не найден среди активных")
+        if M._find_active_job("HASH1", "reflow") is not None:
+            fail("дубль спутал режимы preserve/reflow")
+        M.JOBS["smokeDup"]["status"] = "done"
+        if M._find_active_job("HASH1", "preserve") is not None:
+            fail("завершённая задача ошибочно считается дублем")
+    finally:
+        M.JOBS.pop("smokeDup", None)
+
+
 def main():
     check_garbled_calibration()
     check_cover_truth_correction()
@@ -395,6 +452,7 @@ def main():
     check_reflow_heading_guard()
     check_reflow_garble_guard()
     check_inpaint_letters()
+    check_job_guards()
     make_sample()
     with open(SAMPLE, "rb") as f:
         pdf_bytes = f.read()

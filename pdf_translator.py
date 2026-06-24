@@ -203,6 +203,16 @@ class _ClientError(Exception):
     """4xx від провайдера (поганий ключ/модель/доступ) — повторювати марно."""
     pass
 
+
+class _Aborted(Exception):
+    """Зовнішнє переривання задачі (cancel користувача або timeout/stall).
+    Кидається з abort_cb між батчами — переклад припиняється, API більше не
+    палиться. status: 'cancelled' | 'timeout'."""
+    def __init__(self, status="cancelled", msg=""):
+        self.status = status
+        self.msg = msg
+        super().__init__(msg or status)
+
 _SYS_PROMPT = (
     "Ти — професійний літературний перекладач книжок.\n"
     "Перекладай з {src} на {dst}.\n"
@@ -393,13 +403,15 @@ def _make_batches(items_len, length_of, char_budget):
 
 def translate_blocks(texts, api_key, provider="gemini", model=None,
                      src="ru", dst="uk", char_budget=2500, proofread=False,
-                     progress_cb=None, glossary=None, extra_sys=""):
+                     progress_cb=None, glossary=None, extra_sys="", abort_cb=None):
     """
     Перекладає список рядків. Батчить, перевіряє кількість сегментів,
     fallback по одному. Якщо proofread=True — другий прохід-редактор.
     glossary={термін:переклад} — для єдиної термінології по всій книзі.
     extra_sys — додаткові жорсткі правила в системний промпт (наприклад,
     для обкладинок). Прогрес рахується на обидві фази (переклад + редактор).
+    abort_cb — викликається на початку кожного батчу; якщо кидає _Aborted
+    (cancel/timeout), переклад негайно припиняється і API більше не палиться.
     """
     model = model or _default_model(provider)
     system = _SYS_PROMPT.format(src=_LANG.get(src, src), dst=_LANG.get(dst, dst))
@@ -422,6 +434,8 @@ def translate_blocks(texts, api_key, provider="gemini", model=None,
 
     batches = _make_batches(total, lambda i: len(texts[i]), char_budget)
     for batch in batches:
+        if abort_cb:
+            abort_cb()                       # cancel/timeout -> _Aborted нагору
         segs = [texts[i] for i in batch]
         user = ("Переклади кожен сегмент окремо. Сегменти розділені рядком <<<§>>>. "
                 "Поверни переклади в тому ж порядку, розділені тим самим рядком <<<§>>>. "
@@ -454,12 +468,12 @@ def translate_blocks(texts, api_key, provider="gemini", model=None,
     if proofread:
         out = proofread_blocks(texts, out, api_key, provider, model, src, dst,
                                char_budget=char_budget, on_done=report,
-                               glossary=glossary)
+                               glossary=glossary, abort_cb=abort_cb)
     return out
 
 
 def proofread_blocks(originals, drafts, api_key, provider, model, src, dst,
-                     char_budget=2500, on_done=None, glossary=None):
+                     char_budget=2500, on_done=None, glossary=None, abort_cb=None):
     """Другий прохід: редактор виправляє чернетку, звіряючи з оригіналом."""
     system = _EDITOR_PROMPT.format(src=_LANG.get(src, src), dst=_LANG.get(dst, dst))
     if glossary:
@@ -473,6 +487,8 @@ def proofread_blocks(originals, drafts, api_key, provider, model, src, dst,
 
     batches = _make_batches(n, lambda i: len(originals[i]) + len(drafts[i]), char_budget)
     for batch in batches:
+        if abort_cb:
+            abort_cb()
         user = ("Виправ кожну пару. Пари розділені рядком <<<§>>>. Поверни лише "
                 "виправлені переклади в тому ж порядку, розділені тим самим рядком "
                 "<<<§>>>. Кількість МАЄ збігатися.\n\n"
@@ -853,7 +869,8 @@ def _ocr_lines(page, lang="rus", dpi=200, min_conf=35):
 
 
 def translate_scanned_pdf(pdf_bytes, api_key, provider="gemini", model=None,
-                          src="ru", dst="uk", proofread=False, progress_cb=None):
+                          src="ru", dst="uk", proofread=False, progress_cb=None,
+                          abort_cb=None):
     """Скан-книга: OCR кожної сторінки -> переклад -> накладання поверх скану."""
     lang = _LANG_OCR.get(src, "rus")
     src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -862,6 +879,8 @@ def translate_scanned_pdf(pdf_bytes, api_key, provider="gemini", model=None,
     npages = max(src_doc.page_count, 1)
     page_lines, texts, index = [], [], []
     for pno in range(src_doc.page_count):
+        if abort_cb:
+            abort_cb()                        # cancel/timeout під час OCR-фази
         lines = _ocr_lines(src_doc[pno], lang)
         page_lines.append(lines)
         for li, l in enumerate(lines):
@@ -875,7 +894,7 @@ def translate_scanned_pdf(pdf_bytes, api_key, provider="gemini", model=None,
             progress_cb(40 + int(58 * done / max(total, 1)), 100)
     translated = translate_blocks(texts, api_key, provider=provider, model=model,
                                   src=src, dst=dst, proofread=proofread,
-                                  progress_cb=_shim)
+                                  progress_cb=_shim, abort_cb=abort_cb)
     for k, (pno, li) in enumerate(index):
         page_lines[pno][li]["uk"] = translated[k]
 

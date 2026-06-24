@@ -16,7 +16,10 @@ api_key = ключ обраного провайдера (Gemini: AIza...  /  Gr
 import os
 import io
 import re
+import time
 import uuid
+import hashlib
+import threading
 import traceback
 import requests
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
@@ -72,12 +75,70 @@ def supa_upload_result(path, pdf_bytes):
     return SUPA_URL + "/storage/v1" + r.json()["signedURL"]
 
 
-ENGINE_VERSION = "2026-06-13-inpaint-inner-v1"
+ENGINE_VERSION = "2026-06-24-job-guards-v1"
+
+# --- захист від зависань: потолок часу + детект «немає прогресу» ---
+# (переоприділяється env-змінними; у тестах ставимо малі значення)
+JOB_TOTAL_LIMIT = int(os.environ.get("LIBRO_JOB_TOTAL_LIMIT", 60 * 60))   # 60 хв
+JOB_STALL_LIMIT = int(os.environ.get("LIBRO_JOB_STALL_LIMIT", 8 * 60))    # 8 хв без прогресу
+JOB_WATCH_INTERVAL = float(os.environ.get("LIBRO_JOB_WATCH_INTERVAL", 5))  # такт watchdog
+_ACTIVE = ("queued", "processing")        # статуси «задача жива» (для дублів)
 
 
 def _safe_err(e, limit=200):
     """Текст помилки для статусів/логів: ключі з URL-ів вирізаються (правило 10)."""
     return re.sub(r"key=[A-Za-z0-9_\-\.]+", "key=***", str(e))[:limit]
+
+
+def _ping_provider(api_key, provider, model):
+    """Короткий пінг ключа перед важкою роботою: 4xx (поганий ключ/модель/
+    доступ) -> повертає текст помилки -> задача падає одразу (правило 7), а не
+    після сотні висячих запитів. Мережеві/5xx тут НЕ валять (далі ретраї)."""
+    try:
+        P._llm_call(provider, api_key, model or P._default_model(provider),
+                    "You are a translator.", "ping")
+        return None
+    except P._ClientError as e:
+        return str(e)
+    except Exception:
+        return None
+
+
+def _find_active_job(file_hash, layout_mode):
+    """job_id живої задачі по тому ж файлу (хеш вмісту) і режиму — щоб не
+    плодити дублі на повторному POST (перезавантаження сторінки)."""
+    for jid, j in JOBS.items():
+        if (j.get("file_hash") == file_hash
+                and (j.get("params") or {}).get("layout_mode") == layout_mode
+                and j.get("status") in _ACTIVE):
+            return jid
+    return None
+
+
+def _start_watchdog(job_id):
+    """Сторожовий потік: якщо немає прогресу > JOB_STALL_LIMIT АБО загальний
+    час > JOB_TOTAL_LIMIT — помічає задачу timeout і просить воркер спинитись
+    (cancel+abort_reason). Воркер припиняє палити API на найближчій межі
+    батчу. Демон, гине разом із процесом / по завершенні задачі."""
+    def run():
+        while True:
+            time.sleep(JOB_WATCH_INTERVAL)
+            j = JOBS.get(job_id)
+            if not j or j.get("status") not in _ACTIVE or j.get("cancel"):
+                return
+            now = time.time()
+            total = now - j.get("started", now)
+            stall = now - j.get("last_progress", now)
+            if total > JOB_TOTAL_LIMIT or stall > JOB_STALL_LIMIT:
+                why = ("перевищено час задачі" if total > JOB_TOTAL_LIMIT
+                       else "переклад не рухається")
+                j["abort_reason"] = "timeout"
+                j["cancel"] = True
+                j["status"] = "timeout"
+                j["error"] = (f"timeout: прогін перервано ({why}) — "
+                              "перевірте ключ і мережу")
+                return
+    threading.Thread(target=run, daemon=True).start()
 
 
 # ---------------------------------------------------------------- endpoints
@@ -156,12 +217,37 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
     import sys
     def log(m):
         print(f"[job {job_id}] {m}", flush=True); sys.stdout.flush()
+
+    def abort_cb():
+        """Між батчами: cancel користувача або timeout/stall від watchdog ->
+        _Aborted, переклад спиняється і API більше не палиться."""
+        j = JOBS.get(job_id, {})
+        if j.get("cancel"):
+            if j.get("abort_reason") == "timeout":
+                raise P._Aborted("timeout", j.get("error")
+                                 or "timeout: прогін перервано")
+            raise P._Aborted("cancelled", "задачу скасовано користувачем")
+
     try:
-        JOBS[job_id].update(status="processing", progress=1)
+        now = time.time()
+        JOBS[job_id].update(status="processing", progress=1,
+                            started=now, last_progress=now)
+        _start_watchdog(job_id)
         log(f"start [{ENGINE_VERSION}]: {len(pdf_bytes)//1024}KB, provider={provider}, model={model!r}, src={src}, vision={vision}, cover_vision={cover_vision}, layout={layout_mode}")
 
+        abort_cb()                            # відмінили ще в черзі -> не палимо ключ
+        kerr = _ping_provider(api_key, provider, model)
+        if kerr:
+            log(f"key ping failed: {_safe_err(kerr)}")
+            JOBS[job_id].update(status="error",
+                                error="перевірте API-ключ: " + _safe_err(kerr))
+            return
+
         def cb(done, total):
-            JOBS[job_id]["progress"] = max(1, min(99, int(done / max(total, 1) * 99)))
+            pct = max(1, min(99, int(done / max(total, 1) * 99)))
+            if pct != JOBS[job_id].get("progress"):
+                JOBS[job_id]["last_progress"] = time.time()   # прогрес рухається
+            JOBS[job_id]["progress"] = pct
 
         # ---------------- REFLOW: пересборка книги «з нуля» чистим PDF ----------------
         if layout_mode == "reflow":
@@ -207,7 +293,7 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
                                         api_key, provider=provider,
                                         model=model or None, src=src, dst=dst,
                                         proofread=proofread, progress_cb=cb,
-                                        glossary=glossary)
+                                        glossary=glossary, abort_cb=abort_cb)
                 for k, i in enumerate(need):
                     flow[i]["uk"] = tr[k]
             log("reflow: title page meta...")
@@ -216,10 +302,12 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
             cover_png = _reflow_cover_png(job_id, pdf_bytes, api_key, provider,
                                           model, src, dst, glossary,
                                           cover_mode, log)
+            abort_cb()                        # не зберігати скасовану/таймаут
             log("build_pdf_reflow...")
             out = P.build_pdf_reflow(pdf_bytes, flow, meta, cover_png=cover_png)
             JOBS[job_id]["src_texts"] = {flow[i]["text"]: flow[i].get("uk", "")
                                          for i in good}
+            abort_cb()
             log(f"done: {len(out)//1024}KB")
             path = os.path.join(JOB_DIR, f"{job_id}.pdf")
             with open(path, "wb") as f:
@@ -252,7 +340,8 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
             log("scanned mode -> OCR all pages...")
             out = P.translate_scanned_pdf(pdf_bytes, api_key, provider=provider,
                                           model=model or None, src=src, dst=dst,
-                                          proofread=proofread, progress_cb=cb)
+                                          proofread=proofread, progress_cb=cb,
+                                          abort_cb=abort_cb)
         else:
             flat = [(b["id"], b["text"]) for blk in pages for b in blk]
             log("building glossary (term consistency)...")
@@ -264,7 +353,8 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
             tr = P.translate_blocks([t for _, t in flat], api_key, provider=provider,
                                     model=model or None, src=src, dst=dst,
                                     proofread=proofread, progress_cb=cb,
-                                    glossary=glossary)
+                                    glossary=glossary, abort_cb=abort_cb)
+            abort_cb()                        # не будувати скасований PDF
             log("build_pdf...")
             tmap = {flat[i][0]: tr[i] for i in range(len(flat))}
             # переклади лишаються в пам'яті процесу: /jobs/{id}/rebuild
@@ -330,15 +420,20 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
                     if cover_vision and provider == "gemini":
                         JOBS[job_id]["cover_status"] = "failed"
                     log("cover: could not replace cleanly -> kept original")
+        abort_cb()                            # не зберігати скасовану/таймаут
         log(f"done: {len(out)//1024}KB")
         path = os.path.join(JOB_DIR, f"{job_id}.pdf")
         with open(path, "wb") as f:
             f.write(out)
         JOBS[job_id].update(status="done", progress=100, path=path)
+    except P._Aborted as ab:
+        log(f"ABORTED [{ab.status}]: {ab.msg}")
+        JOBS[job_id].update(status=ab.status,
+                            error=ab.msg or ab.status, progress=0)
     except Exception as e:
         traceback.print_exc()
-        log(f"ERROR: {e}")
-        JOBS[job_id].update(status="error", error=str(e)[:500])
+        log(f"ERROR: {_safe_err(e)}")
+        JOBS[job_id].update(status="error", error=_safe_err(e, 500))
 
 
 @app.post("/jobs")
@@ -359,10 +454,22 @@ async def create_job(background: BackgroundTasks,
     if layout_mode not in ("preserve", "reflow"):
         raise HTTPException(400, "layout_mode: preserve | reflow")
     pdf_bytes = await file.read()
+    # захист від дублів: той самий файл (хеш вмісту) у тому ж режимі вже
+    # обробляється -> не плодимо другу задачу, повертаємо наявну (перезавантаження
+    # сторінки / подвійний клік не запускають повторний прогін і не палять API)
+    file_hash = hashlib.sha256(pdf_bytes).hexdigest()
+    dup = _find_active_job(file_hash, layout_mode)
+    if dup:
+        return JSONResponse({
+            "job_id": dup, "status_url": f"/jobs/{dup}",
+            "download_url": f"/jobs/{dup}/download", "reused": True,
+            "note": "цей файл уже перекладається — повертаю наявну задачу",
+        }, status_code=200)
     job_id = uuid.uuid4().hex[:12]
     base = (file.filename or "book").rsplit(".", 1)[0]
     suffix = "_uk_reflow.pdf" if layout_mode == "reflow" else "_uk.pdf"
     JOBS[job_id] = {"status": "queued", "progress": 0, "name": f"{base}{suffix}",
+                    "file_hash": file_hash,
                     "params": {"provider": provider, "model": model, "src": src,
                                "dst": dst, "proofread": proofread,
                                "layout_mode": layout_mode}}
@@ -424,13 +531,31 @@ async def rebuild_job(job_id: str, background: BackgroundTasks,
     }, status_code=202)
 
 
+@app.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    """Скасувати задачу: воркер припиняє обробку і перестає палити API на
+    найближчій межі батчу. Фронт має слати це при закритті/перезавантаженні
+    сторінки, щоб задача не молотила у фоні. Повертає поточний статус
+    ('cancelling', доки воркер не дійшов до межі; потім /jobs/{id} = 'cancelled')."""
+    j = JOBS.get(job_id)
+    if not j:
+        return JSONResponse({"status": "unknown"}, status_code=404)
+    if j.get("status") not in _ACTIVE:
+        return {"status": j.get("status"), "final": True}
+    j["cancel"] = True
+    j["abort_reason"] = "cancelled"
+    j["status"] = "cancelling"
+    return {"status": "cancelling"}
+
+
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str):
     j = JOBS.get(job_id)
     if not j:
         return JSONResponse({"status": "unknown"}, status_code=404)
     return {k: v for k, v in j.items()
-            if k not in ("path", "src_texts", "params")}
+            if k not in ("path", "src_texts", "params", "file_hash",
+                         "started", "last_progress", "cancel", "abort_reason")}
 
 
 @app.get("/jobs/{job_id}/download")
