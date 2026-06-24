@@ -18,6 +18,7 @@ import io
 import re
 import time
 import uuid
+import queue
 import hashlib
 import threading
 import traceback
@@ -75,7 +76,7 @@ def supa_upload_result(path, pdf_bytes):
     return SUPA_URL + "/storage/v1" + r.json()["signedURL"]
 
 
-ENGINE_VERSION = "2026-06-24-job-guards-v1"
+ENGINE_VERSION = "2026-06-24-parallel-jobs-v1"
 
 # --- захист від зависань: потолок часу + детект «немає прогресу» ---
 # (переоприділяється env-змінними; у тестах ставимо малі значення)
@@ -83,6 +84,12 @@ JOB_TOTAL_LIMIT = int(os.environ.get("LIBRO_JOB_TOTAL_LIMIT", 60 * 60))   # 60 �
 JOB_STALL_LIMIT = int(os.environ.get("LIBRO_JOB_STALL_LIMIT", 8 * 60))    # 8 хв без прогресу
 JOB_WATCH_INTERVAL = float(os.environ.get("LIBRO_JOB_WATCH_INTERVAL", 5))  # такт watchdog
 _ACTIVE = ("queued", "processing")        # статуси «задача жива» (для дублів)
+
+# --- пул воркерів: паралельні переклади з лімітом (захист контейнера) ---
+# MAX_PARALLEL_JOBS=1 -> строго послідовно (як було, прод не ламається);
+# =2 -> дві книги одночасно (кожна на своєму ключі — ключ передається у
+# задачу, стан не ділиться). Більше за ліміт -> чекають у черзі.
+MAX_PARALLEL_JOBS = max(1, int(os.environ.get("MAX_PARALLEL_JOBS", 2)))
 
 
 def _safe_err(e, limit=200):
@@ -139,6 +146,48 @@ def _start_watchdog(job_id):
                               "перевірте ключ і мережу")
                 return
     threading.Thread(target=run, daemon=True).start()
+
+
+# ---------------------------------------------------------------- worker pool
+_JOB_QUEUE = queue.Queue()
+_WORKERS_STARTED = False
+_WORKERS_LOCK = threading.Lock()
+
+
+def _worker_loop():
+    """Воркер: бере задачу з черги і виконує _run_local_job. Падіння однієї
+    задачі НЕ валить воркер (ловимо) і не чіпає інші — кожна ізольована
+    (свій JOBS[id], свій watchdog, своя відміна)."""
+    while True:
+        args = _JOB_QUEUE.get()
+        try:
+            _run_local_job(*args)
+        except Exception as e:                # _run_local_job сам ловить усе;
+            traceback.print_exc()             # це лише страховка від падіння воркера
+            jid = args[0] if args else None
+            if jid in JOBS and JOBS[jid].get("status") in _ACTIVE:
+                JOBS[jid].update(status="error", error=_safe_err(e, 500))
+        finally:
+            _JOB_QUEUE.task_done()
+
+
+def _ensure_workers():
+    """Лінивий старт пулу: MAX_PARALLEL_JOBS воркер-потоків (один раз)."""
+    global _WORKERS_STARTED
+    with _WORKERS_LOCK:
+        if _WORKERS_STARTED:
+            return
+        for _ in range(MAX_PARALLEL_JOBS):
+            threading.Thread(target=_worker_loop, daemon=True).start()
+        _WORKERS_STARTED = True
+        print(f"job pool: {MAX_PARALLEL_JOBS} worker(s) started", flush=True)
+
+
+def _enqueue_job(*args):
+    """Поставити задачу в чергу. Воркер візьме її, щойно звільниться слот
+    (понад ліміт — чекає у статусі 'queued', не запускається одразу)."""
+    _ensure_workers()
+    _JOB_QUEUE.put(args)
 
 
 # ---------------------------------------------------------------- endpoints
@@ -437,8 +486,7 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
 
 
 @app.post("/jobs")
-async def create_job(background: BackgroundTasks,
-                     file: UploadFile = File(...), api_key: str = Form(...),
+async def create_job(file: UploadFile = File(...), api_key: str = Form(...),
                      provider: str = Form("gemini"), model: str = Form(""),
                      src: str = Form("ru"), dst: str = Form("uk"),
                      proofread: bool = Form(False),
@@ -479,9 +527,9 @@ async def create_job(background: BackgroundTasks,
             f.write(pdf_bytes)
     except Exception as e:
         print("src save failed:", e)
-    background.add_task(_run_local_job, job_id, pdf_bytes, api_key, provider,
-                        model, src, dst, proofread, file.filename, vision,
-                        vision_model, cover_vision, layout_mode, cover_mode)
+    _enqueue_job(job_id, pdf_bytes, api_key, provider,
+                 model, src, dst, proofread, file.filename, vision,
+                 vision_model, cover_vision, layout_mode, cover_mode)
     return JSONResponse({
         "job_id": job_id,
         "status_url": f"/jobs/{job_id}",
@@ -490,7 +538,7 @@ async def create_job(background: BackgroundTasks,
 
 
 @app.post("/jobs/{job_id}/rebuild")
-async def rebuild_job(job_id: str, background: BackgroundTasks,
+async def rebuild_job(job_id: str,
                       api_key: str = Form(...), model: str = Form(""),
                       cover_mode: str = Form("")):
     """Пересборка ГОТОВОГО перекладу чистим reflow-PDF: новий job у режимі
@@ -517,12 +565,12 @@ async def rebuild_job(job_id: str, background: BackgroundTasks,
     except Exception as e:
         print("src save failed:", e)
     reuse = j.get("src_texts") or None
-    background.add_task(_run_local_job, new_id, pdf_bytes, api_key,
-                        params.get("provider", "gemini"),
-                        model or params.get("model", ""),
-                        params.get("src", "ru"), params.get("dst", "uk"),
-                        params.get("proofread", False), j.get("name"),
-                        False, "", False, "reflow", cover_mode, reuse)
+    _enqueue_job(new_id, pdf_bytes, api_key,
+                 params.get("provider", "gemini"),
+                 model or params.get("model", ""),
+                 params.get("src", "ru"), params.get("dst", "uk"),
+                 params.get("proofread", False), j.get("name"),
+                 False, "", False, "reflow", cover_mode, reuse)
     return JSONResponse({
         "job_id": new_id,
         "status_url": f"/jobs/{new_id}",
@@ -546,6 +594,22 @@ def cancel_job(job_id: str):
     j["abort_reason"] = "cancelled"
     j["status"] = "cancelling"
     return {"status": "cancelling"}
+
+
+@app.get("/jobs")
+def list_jobs():
+    """Список усіх задач із прогресом — щоб фронт показав кілька книг разом
+    (наприклад, дві паралельні). Без службових/секретних полів (ключ у JOBS
+    не зберігається — правило 10). active = скільки задач живі, queue_len —
+    скільки чекає на вільний слот пулу."""
+    jobs = [{"job_id": jid, "status": j.get("status"),
+             "progress": j.get("progress", 0), "name": j.get("name"),
+             "cover_status": j.get("cover_status"),
+             "error": j.get("error")}
+            for jid, j in JOBS.items()]
+    active = sum(1 for j in JOBS.values() if j.get("status") in _ACTIVE)
+    return {"max_parallel": MAX_PARALLEL_JOBS, "active": active,
+            "queue_len": _JOB_QUEUE.qsize(), "jobs": jobs}
 
 
 @app.get("/jobs/{job_id}")

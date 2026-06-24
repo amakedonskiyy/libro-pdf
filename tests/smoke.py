@@ -445,6 +445,56 @@ def check_job_guards():
         M.JOBS.pop("smokeDup", None)
 
 
+def check_worker_pool():
+    """Worker pool (без сети): лимит читается, список GET /jobs отдаёт прогресс
+    без секретов, пул реально держит лимит параллелизма."""
+    import main as M
+    import threading as _t
+    if M.MAX_PARALLEL_JOBS < 1:
+        fail(f"MAX_PARALLEL_JOBS < 1: {M.MAX_PARALLEL_JOBS}")
+    # list_jobs: структура + без секретных/служебных полей
+    M.JOBS["wp1"] = {"status": "processing", "progress": 42, "name": "a.pdf",
+                     "file_hash": "H", "path": "/x", "params": {"src": "ru"}}
+    lst = M.list_jobs()
+    if "max_parallel" not in lst or not any(j["job_id"] == "wp1" for j in lst["jobs"]):
+        fail("list_jobs не вернул задачу/лимит")
+    leaked = [k for j in lst["jobs"] for k in j
+              if k in ("file_hash", "path", "params", "src_texts", "api_key")]
+    if leaked:
+        fail(f"list_jobs протёк служебные/секретные поля: {leaked}")
+    M.JOBS.pop("wp1", None)
+
+    # пул держит лимит: фейковые «задачи» через подмену _run_local_job
+    running = {"now": 0, "max": 0}
+    lock = _t.Lock()
+    done = _t.Event()
+    counter = {"n": 0}
+    def fake_job(job_id, *a, **k):
+        with lock:
+            running["now"] += 1
+            running["max"] = max(running["max"], running["now"])
+        time.sleep(0.25)
+        with lock:
+            running["now"] -= 1
+            counter["n"] += 1
+            if counter["n"] == 5:
+                done.set()
+    orig = M._run_local_job
+    M._run_local_job = fake_job
+    try:
+        M._ensure_workers()
+        for i in range(5):                       # 5 задач при лимите MAX_PARALLEL_JOBS
+            M._enqueue_job(f"fake{i}")
+        if not done.wait(timeout=10):
+            fail("пул не обработал все задачи вовремя")
+        if running["max"] > M.MAX_PARALLEL_JOBS:
+            fail(f"пул превысил лимит: {running['max']} > {M.MAX_PARALLEL_JOBS}")
+        if M.MAX_PARALLEL_JOBS >= 2 and running["max"] < 2:
+            fail("пул не дал параллелизма при лимите >=2")
+    finally:
+        M._run_local_job = orig
+
+
 def main():
     check_garbled_calibration()
     check_cover_truth_correction()
@@ -453,6 +503,7 @@ def main():
     check_reflow_garble_guard()
     check_inpaint_letters()
     check_job_guards()
+    check_worker_pool()
     make_sample()
     with open(SAMPLE, "rb") as f:
         pdf_bytes = f.read()
