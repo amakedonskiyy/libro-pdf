@@ -17,6 +17,7 @@ __pycache__/
 tests/out_*
 tests/sample_*.pdf
 tests/reflow_preview_*
+tests/inpaint_*
 
 # --- Локальные DejaVu TTF для мака (на проде шрифты ставит Dockerfile) ---
 .fonts/

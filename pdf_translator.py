@@ -604,12 +604,15 @@ def _font_assets():
 
 
 def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
-              keep_image_bg=True, recipe=None):
+              keep_image_bg=True, recipe=None, inpaint_over_images=True):
     """
     pdf_bytes      — оригінальний PDF.
     pages_blocks   — результат extract_blocks().
     translations   — {block_id: "переклад"}.
     recipe         — правила від зору (напр. {"uniform_bg":true,"page_bg":[245,240,225]}).
+    inpaint_over_images — для блоків ПОВЕРХ зображення стирати оригінал
+                    інпейнтингом (маска літер + cv2.inpaint, як в обкладинках),
+                    а не заливкою прямокутником; False -> стара заливка.
     Повертає bytes готового PDF.
     """
     import statistics
@@ -643,11 +646,34 @@ def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
             body = round(statistics.median(sizes))
         body = max(6, min(int(body), 16))
 
-        # --- рендеримо сторінку (раз) для підбору кольору фону ---
+        # --- блоки ПОВЕРХ зображення -> інпейнтинг замість заливки ---
+        # (на фото/ілюстрації прямокутник фону = видима заплатка; правило 4 не
+        #  зачіпається — биті блоки сюди не доходять, відсіялись у live)
+        def _bbarea(bb):
+            return max(0.0, bb[2] - bb[0]) * max(0.0, bb[3] - bb[1])
+        img_boxes = []
+        if inpaint_over_images:
+            try:
+                pa = page_r.width * page_r.height
+                img_boxes = [im["bbox"] for im in page.get_image_info()
+                             if _bbarea(im["bbox"]) > 0.05 * pa]
+            except Exception:
+                img_boxes = []
+
+        def _over_image(bb):
+            for ib in img_boxes:
+                ox = min(bb[2], ib[2]) - max(bb[0], ib[0])
+                oy = min(bb[3], ib[3]) - max(bb[1], ib[1])
+                if ox > 0 and oy > 0 and ox * oy > 0.6 * max(_bbarea(bb), 1.0):
+                    return True
+            return False
+        over = {b["id"]: _over_image(b["bbox"]) for b in live} if img_boxes else {}
+
+        # --- рендеримо сторінку (раз) для підбору кольору фону ТА інпейнту ---
         # ЗАВЖДИ (не лише за наявності картинок): так кремові/пергаментні
         # сторінки заливаються своїм тоном, а не білим.
         pimg, zoom = None, 2.0
-        if uni_bg is None:
+        if uni_bg is None or any(over.values()):
             try:
                 from PIL import Image
                 pm = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
@@ -655,13 +681,31 @@ def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
             except Exception:
                 pimg = None
 
-        # 3a. РЕДАКЦІЯ: фізично видаляємо оригінал ЛИШЕ під перекладеними блоками,
-        #     заливаючи справжнім тоном фону.
+        # інпейнт-чистка регіонів блоків поверх зображення (одна маска/inpaint)
+        cleaned_pimg = None
+        if pimg is not None and any(over.values()):
+            regions = []
+            for b in live:
+                if over.get(b["id"]):
+                    x0, y0, x1, y1 = b["bbox"]
+                    cc = b["color"]
+                    col = (int(cc[0] * 255), int(cc[1] * 255), int(cc[2] * 255))
+                    regions.append((x0 * zoom, y0 * zoom, x1 * zoom, y1 * zoom, col))
+            cleaned_pimg, _did = _inpaint_letters(pimg, regions)
+            if not _did:
+                cleaned_pimg = None       # нічого не стерто -> звичайна заливка
+
+        # 3a. РЕДАКЦІЯ: фізично видаляємо оригінал ЛИШЕ під перекладеними блоками.
+        #     Блоки поверх зображення -> без заливки (fill=False): потім кладемо
+        #     інпейнт-патч. Решта -> заливка справжнім тоном фону.
         for b in live:
             r = fitz.Rect(b["bbox"])
             r.x0 -= 1.5; r.y0 -= 1.5; r.x1 += 1.5; r.y1 += 1.5
             r = r & page_r                      # обов'язково в межах сторінки!
             if r.is_empty:
+                continue
+            if cleaned_pimg is not None and over.get(b["id"]):
+                page.add_redact_annot(r, fill=False)
                 continue
             if uni_bg is not None:               # зір: один колір на всю книгу
                 fill = uni_bg
@@ -674,6 +718,23 @@ def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
             page.add_redact_annot(r, fill=fill)
         # текст видаляємо (default), зображення НЕ чіпаємо
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+
+        # інпейнт-патчі поверх зображення (натуральний фон замість прямокутника)
+        if cleaned_pimg is not None:
+            for b in live:
+                if not over.get(b["id"]):
+                    continue
+                x0, y0, x1, y1 = b["bbox"]
+                px = (max(0, int(x0 * zoom)), max(0, int(y0 * zoom)),
+                      min(cleaned_pimg.width, int(x1 * zoom)),
+                      min(cleaned_pimg.height, int(y1 * zoom)))
+                if px[2] <= px[0] or px[3] <= px[1]:
+                    continue
+                buf = io.BytesIO()
+                cleaned_pimg.crop(px).save(buf, "PNG")
+                ir = fitz.Rect(x0, y0, x1, y1) & page_r
+                if not ir.is_empty:
+                    page.insert_image(ir, stream=buf.getvalue())
 
         # верх найближчого блоку нижче (по колонці) — щоб переклад не налазив униз
         def floor_for(bb):
@@ -1300,6 +1361,47 @@ def _contrast_mask(region):
     _t, bin_ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     m = bin_ > 0
     return m if float(m.mean()) <= 0.5 else ~m
+
+
+def _inpaint_letters(page_pil, regions, max_share=0.5):
+    """Стирає літери текстових регіонів з РАСТРОВОЇ сторінки через cv2.inpaint
+    (той самий механізм, що в обкладинках) — для тексту ПОВЕРХ зображення,
+    замість заливки прямокутником. regions: [(x0,y0,x1,y1,(r,g,b))] у пікселях
+    page_pil (колір літер 0..255). Маска: колір (поріг 48 -> 90) -> контраст-
+    фолбек. Повертає (PIL RGB, True), якщо щось стерто; інакше (вихідний, False).
+    Будь-яка помилка cv2 / порожня / завелика (> max_share) маска -> (вихідний,
+    False): виклика́ч лишається на звичайній заливці фоном."""
+    try:
+        import numpy as np
+        import cv2
+        from PIL import Image
+        arr = np.asarray(page_pil.convert("RGB"), dtype=np.uint8)
+        H, W = arr.shape[:2]
+        mask = np.zeros((H, W), np.uint8)
+        pad = 3
+        touched = False
+        for x0, y0, x1, y1, color in regions:
+            ix0, iy0 = max(0, int(x0 - pad)), max(0, int(y0 - pad))
+            ix1, iy1 = min(W, int(x1 + pad) + 1), min(H, int(y1 + pad) + 1)
+            if ix1 <= ix0 or iy1 <= iy0:
+                continue
+            region = arr[iy0:iy1, ix0:ix1]
+            sub = _color_mask(region, color)
+            if float(sub.mean()) < 0.01:
+                sub = _color_mask(region, color, thr=90)
+            if float(sub.mean()) < 0.01:
+                sub = _contrast_mask(region)
+            mask[iy0:iy1, ix0:ix1][sub] = 255
+            touched = True
+        if not touched or float((mask > 0).mean()) > max_share:
+            return page_pil, False
+        kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.dilate(mask, kern, iterations=1)
+        clean = cv2.inpaint(np.ascontiguousarray(arr), mask, 4, cv2.INPAINT_TELEA)
+        return Image.fromarray(clean), True
+    except Exception as e:
+        print("inpaint letters failed:", e)
+        return page_pil, False
 
 
 def _mask_lines(m):
@@ -2306,8 +2408,34 @@ def build_pdf_reflow(pdf_bytes, flow, meta, cover_png=None,
     for kind, seg in segments:
         if kind == "pageimg":
             pg = body.new_page(width=W, height=H)
-            pix = src[seg["page"]].get_pixmap(matrix=fitz.Matrix(2, 2))
-            pg.insert_image(pg.rect, stream=pix.tobytes("png"))
+            spage = src[seg["page"]]
+            z = 2.0
+            from PIL import Image
+            pm = spage.get_pixmap(matrix=fitz.Matrix(z, z))
+            pimg = Image.open(io.BytesIO(pm.tobytes("png"))).convert("RGB")
+            # стираємо оригінальний текст-шар з ілюстрації інпейнтингом (той
+            # самий механізм, що в build_pdf / обкладинках) — щоб у чистій книзі
+            # на картинці не лишалось напису мовою оригіналу замість плашки
+            regions = []
+            try:
+                for b in spage.get_text("dict")["blocks"]:
+                    if b.get("type") != 0:
+                        continue
+                    for ln in b["lines"]:
+                        spans = [s for s in ln["spans"] if s["text"].strip()]
+                        if not spans:
+                            continue
+                        col = max(spans, key=lambda s: len(s["text"])).get("color", 0)
+                        rgb = ((col >> 16) & 255, (col >> 8) & 255, col & 255)
+                        bx = ln["bbox"]
+                        regions.append((bx[0]*z, bx[1]*z, bx[2]*z, bx[3]*z, rgb))
+            except Exception:
+                regions = []
+            if regions:
+                pimg, _ = _inpaint_letters(pimg, regions)
+            buf = io.BytesIO()
+            pimg.save(buf, "PNG")
+            pg.insert_image(pg.rect, stream=buf.getvalue())
             continue
         parts, after_head = [], False
         for el in seg:

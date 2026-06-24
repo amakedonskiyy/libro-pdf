@@ -361,12 +361,40 @@ def check_reflow_heading_guard():
         fail("reflow heading-guard: легитимный H1 'Глава перша' подавлен")
 
 
+def check_inpaint_letters():
+    """_inpaint_letters стирает буквы текстового региона с «фото» через
+    cv2.inpaint (механизм обложек) — тёмных пикселей текста становится меньше,
+    а без регионов картинка не трогается."""
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+    img = Image.new("RGB", (220, 90), (175, 145, 115))     # «фото» (тёплый фон)
+    serif = P._FONTS[("serif", True, False)]
+    if not os.path.exists(serif):
+        fail(f"нет шрифта для теста inpaint: {serif}")
+    d = ImageDraw.Draw(img)
+    d.text((12, 28), "ТЕКСТ", font=ImageFont.truetype(serif, 34), fill=(8, 8, 8))
+    arr0 = np.asarray(img)
+    dark0 = int((arr0.sum(2) < 90).sum())
+    if dark0 < 50:
+        fail("inpaint-тест: текст не нарисовался")
+    cleaned, did = P._inpaint_letters(img, [(8, 24, 200, 70, (8, 8, 8))])
+    if not did:
+        fail("inpaint: маска пустая на явном тексте")
+    dark1 = int((np.asarray(cleaned).sum(2) < 90).sum())
+    if dark1 >= dark0 * 0.5:
+        fail(f"inpaint: тёмные пиксели текста не убраны ({dark0}->{dark1})")
+    _same, did2 = P._inpaint_letters(img, [])
+    if did2:
+        fail("inpaint: тронул картинку без регионов")
+
+
 def main():
     check_garbled_calibration()
     check_cover_truth_correction()
     check_reflow_paragraphs()
     check_reflow_heading_guard()
     check_reflow_garble_guard()
+    check_inpaint_letters()
     make_sample()
     with open(SAMPLE, "rb") as f:
         pdf_bytes = f.read()
