@@ -626,6 +626,39 @@ def check_resume_checkpoint():
         M.JOBS.pop(jid, None)
 
 
+def check_chunk_build():
+    """Чанк-сборка build_pdf (без сети): разный CHUNK_PAGES -> ИДЕНТИЧНАЯ вёрстка
+    и то же число страниц (склейка чанков не теряет/не дублирует страницы)."""
+    import numpy as np
+    from PIL import Image
+    serif = P._FONTS[("serif", False, False)]
+    doc = fitz.open()
+    for pno in range(5):
+        pg = doc.new_page(width=300, height=400)
+        pg.insert_textbox(fitz.Rect(30, 50, 270, 130),
+                          f"Сторінка {pno}. Абзац оригіналу для перевірки.",
+                          fontsize=11, fontname="s", fontfile=serif)
+    bb = io.BytesIO(); doc.save(bb); doc.close()
+    pdf = bb.getvalue()
+    pages = P.extract_blocks(pdf, ocr_lang="rus")
+    tmap = {b["id"]: "Переклад абзацу українською мовою." for blk in pages for b in blk}
+    os.environ["CHUNK_PAGES"] = "2"                  # дробим на чанки -> стыки
+    out_chunk = P.build_pdf(pdf, pages, tmap)
+    os.environ["CHUNK_PAGES"] = "99"                 # один чанк -> монолит-эквивалент
+    out_mono = P.build_pdf(pdf, pages, tmap)
+    os.environ.pop("CHUNK_PAGES", None)
+    dc = fitz.open(stream=out_chunk, filetype="pdf")
+    dm = fitz.open(stream=out_mono, filetype="pdf")
+    if dc.page_count != 5 or dm.page_count != 5:
+        fail(f"chunk: страниц {dc.page_count}/{dm.page_count} вместо 5 (потеря/дубль)")
+    for pn in range(5):
+        a = np.asarray(Image.open(io.BytesIO(dc[pn].get_pixmap().tobytes("png"))).convert("RGB")).astype(int)
+        b = np.asarray(Image.open(io.BytesIO(dm[pn].get_pixmap().tobytes("png"))).convert("RGB")).astype(int)
+        if a.shape != b.shape or int(np.abs(a - b).max()) > 2:
+            fail(f"chunk: стр {pn} вёрстка chunk != mono")
+    dc.close(); dm.close()
+
+
 def main():
     check_garbled_calibration()
     check_cover_truth_correction()
@@ -638,6 +671,7 @@ def main():
     check_vision_retry()
     check_quality_scan()
     check_resume_checkpoint()
+    check_chunk_build()
     make_sample()
     with open(SAMPLE, "rb") as f:
         pdf_bytes = f.read()

@@ -77,7 +77,7 @@ def supa_upload_result(path, pdf_bytes):
     return SUPA_URL + "/storage/v1" + r.json()["signedURL"]
 
 
-ENGINE_VERSION = "2026-06-24-resume-v1"
+ENGINE_VERSION = "2026-06-24-chunk-build-v1"
 
 # --- захист від зависань: потолок часу + детект «немає прогресу» ---
 # (переоприділяється env-змінними; у тестах ставимо малі значення)

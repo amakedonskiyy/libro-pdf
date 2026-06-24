@@ -626,6 +626,166 @@ def _font_assets():
     return _FONT_ASSETS
 
 
+def _render_page_block(doc, blocks, translations, uni_bg, inpaint_over_images,
+                       page_offset=0):
+    """Рендер ОДНІЄЇ сторінки в переданий doc: редакція оригіналу під
+    перекладеними блоками + інпейнт поверх зображень + вставка перекладу
+    (insert_htmlbox). page_offset — зсув для чанк-збірки (сторінка адресується
+    як doc[b['page'] - page_offset]). Логіка ІДЕНТИЧНА монолітній збірці —
+    змінено лише адресацію сторінки; вёрстка та сама."""
+    import statistics
+    import html as _html
+    page = doc[blocks[0]["page"] - page_offset]
+    page_r = page.rect
+
+    # --- беремо лише блоки з НЕПОРОЖНІМ перекладом ---
+    live = [b for b in blocks
+            if (translations.get(b["id"]) or "").strip()
+            and not b.get("garbled")
+            and not _looks_garbled(translations.get(b["id"]) or "")]
+    if not live:
+        return
+
+    # --- ОДИН рівний розмір основного тексту на сторінку ---
+    sizes = [max(1, round(b["size"])) for b in live]
+    try:
+        body = statistics.mode(sizes)
+    except statistics.StatisticsError:
+        body = round(statistics.median(sizes))
+    body = max(6, min(int(body), 16))
+
+    # --- блоки ПОВЕРХ зображення -> інпейнтинг замість заливки (правило 4) ---
+    def _bbarea(bb):
+        return max(0.0, bb[2] - bb[0]) * max(0.0, bb[3] - bb[1])
+    img_boxes = []
+    if inpaint_over_images:
+        try:
+            pa = page_r.width * page_r.height
+            img_boxes = [im["bbox"] for im in page.get_image_info()
+                         if _bbarea(im["bbox"]) > 0.05 * pa]
+        except Exception:
+            img_boxes = []
+
+    def _over_image(bb):
+        for ib in img_boxes:
+            ox = min(bb[2], ib[2]) - max(bb[0], ib[0])
+            oy = min(bb[3], ib[3]) - max(bb[1], ib[1])
+            if ox > 0 and oy > 0 and ox * oy > 0.6 * max(_bbarea(bb), 1.0):
+                return True
+        return False
+    over = {b["id"]: _over_image(b["bbox"]) for b in live} if img_boxes else {}
+
+    # --- рендер сторінки (раз) для підбору кольору фону ТА інпейнту ---
+    pimg, zoom = None, 2.0
+    if uni_bg is None or any(over.values()):
+        try:
+            from PIL import Image
+            pm = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+            pimg = Image.open(io.BytesIO(pm.tobytes("png"))).convert("RGB")
+        except Exception:
+            pimg = None
+
+    cleaned_pimg = None
+    if pimg is not None and any(over.values()):
+        regions = []
+        for b in live:
+            if over.get(b["id"]):
+                x0, y0, x1, y1 = b["bbox"]
+                cc = b["color"]
+                col = (int(cc[0] * 255), int(cc[1] * 255), int(cc[2] * 255))
+                regions.append((x0 * zoom, y0 * zoom, x1 * zoom, y1 * zoom, col))
+        cleaned_pimg, _did = _inpaint_letters(pimg, regions)
+        if not _did:
+            cleaned_pimg = None           # нічого не стерто -> звичайна заливка
+
+    # 3a. РЕДАКЦІЯ оригіналу під перекладеними блоками.
+    for b in live:
+        r = fitz.Rect(b["bbox"])
+        r.x0 -= 1.5; r.y0 -= 1.5; r.x1 += 1.5; r.y1 += 1.5
+        r = r & page_r
+        if r.is_empty:
+            continue
+        if cleaned_pimg is not None and over.get(b["id"]):
+            page.add_redact_annot(r, fill=False)
+            continue
+        if uni_bg is not None:
+            fill = uni_bg
+        elif pimg is not None:
+            x0, y0, x1, y1 = b["bbox"]
+            c = _sample_bg(pimg, x0 * zoom, y0 * zoom, x1 * zoom, y1 * zoom)
+            fill = (c[0] / 255, c[1] / 255, c[2] / 255)
+        else:
+            fill = (1, 1, 1)
+        page.add_redact_annot(r, fill=fill)
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+
+    # інпейнт-патчі поверх зображення (натуральний фон замість прямокутника)
+    if cleaned_pimg is not None:
+        for b in live:
+            if not over.get(b["id"]):
+                continue
+            x0, y0, x1, y1 = b["bbox"]
+            px = (max(0, int(x0 * zoom)), max(0, int(y0 * zoom)),
+                  min(cleaned_pimg.width, int(x1 * zoom)),
+                  min(cleaned_pimg.height, int(y1 * zoom)))
+            if px[2] <= px[0] or px[3] <= px[1]:
+                continue
+            buf = io.BytesIO()
+            cleaned_pimg.crop(px).save(buf, "PNG")
+            ir = fitz.Rect(x0, y0, x1, y1) & page_r
+            if not ir.is_empty:
+                page.insert_image(ir, stream=buf.getvalue())
+
+    # верх найближчого блоку нижче (по колонці) — щоб переклад не налазив униз
+    def floor_for(bb):
+        bx0, byt, bx1 = bb["bbox"][0], bb["bbox"][1], bb["bbox"][2]
+        f = page_r.y1 - 2
+        for o in live:
+            if o is bb:
+                continue
+            ox0, oy0, ox1, _ = o["bbox"]
+            if oy0 > byt + 2 and ox1 > bx0 and ox0 < bx1:
+                f = min(f, oy0 - 2)
+        return f
+
+    # 3b. Вставляємо переклад через insert_htmlbox.
+    _arch, _face_css = _font_assets()
+    for b in live:
+        tgt = translations.get(b["id"])
+        is_head = (b["size"] >= body * 1.4 and len(tgt.strip()) <= 55)
+        place_sz = min(b["size"], body * 2.2) if is_head else float(body)
+        x0, y0, x1, y1 = b["bbox"]
+        left = max(x0, 2.0)
+        right = min(x1, page_r.x1 - 2.0)
+        if right <= left + 20:
+            right = min(left + 130, page_r.x1 - 2.0)
+        bottom = floor_for(b)
+        if bottom <= y0 + 8:
+            bottom = min(y0 + max(y1 - y0, 12), page_r.y1 - 2.0)
+        rect = fitz.Rect(left, y0 - 1, right, bottom)
+        ff = b["fontfile"] or ""
+        serif = "Serif" in ff
+        fam = "'BookSerif',serif" if serif else "'BookSans',sans-serif"
+        weight = "bold" if "Bold" in ff else "normal"
+        style = "italic" if ("Italic" in ff or "Oblique" in ff) else "normal"
+        r, g, bl = b["color"]
+        hexc = "#%02x%02x%02x" % (int(r * 255), int(g * 255), int(bl * 255))
+        css = (_face_css +
+               "*{margin:0;padding:0;line-height:1.15;font-family:%s;color:%s;}"
+               % (fam, hexc))
+        htmltxt = ('<div style="font-size:%.1fpx;font-weight:%s;font-style:%s">%s</div>'
+                   % (place_sz, weight, style, _html.escape(tgt)))
+        try:
+            if _arch is not None:
+                page.insert_htmlbox(rect, htmltxt, css=css, archive=_arch)
+            else:
+                page.insert_htmlbox(rect, htmltxt, css=css)
+        except Exception:
+            _place_text(page, b["bbox"], tgt, b["fontname"], b["fontfile"],
+                        b["color"], place_sz, col_right=b["bbox"][2],
+                        max_bottom=bottom)
+
+
 def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
               keep_image_bg=True, recipe=None, inpaint_over_images=True):
     """
@@ -634,190 +794,53 @@ def build_pdf(pdf_bytes: bytes, pages_blocks, translations: dict,
     translations   — {block_id: "переклад"}.
     recipe         — правила від зору (напр. {"uniform_bg":true,"page_bg":[245,240,225]}).
     inpaint_over_images — для блоків ПОВЕРХ зображення стирати оригінал
-                    інпейнтингом (маска літер + cv2.inpaint, як в обкладинках),
-                    а не заливкою прямокутником; False -> стара заливка.
+                    інпейнтингом, а не заливкою прямокутником; False -> заливка.
     Повертає bytes готового PDF.
+
+    ПАМ'ЯТЬ (чанк-збірка): insert_htmlbox накопичує ~0.6МБ/блок у doc до save —
+    на 2899 блоків це ~1.9ГБ і OOM на 400-стор. книгах. Тому збираємо ЧАНКАМИ
+    по CHUNK_PAGES сторінок у ОКРЕМІ doc, кожен звільняємо, і зливаємо через
+    insert_pdf. Пік стає «один чанк» (~0.3ГБ). Вёрстка ІДЕНТИЧНА (той самий
+    _render_page_block на блок) — змінено лише пам'ять.
     """
-    import statistics
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    import os
     recipe = recipe or {}
-    # глобальний колір фону від зору (якщо книга однотонна) — 0..1
     uni_bg = _rgb01(recipe["page_bg"]) if (recipe.get("uniform_bg") and recipe.get("page_bg")) else None
+    chunk_pages = max(1, int(os.environ.get("CHUNK_PAGES", 40)))
 
-    for blocks in pages_blocks:
-        if not blocks:
-            continue
-        page = doc[blocks[0]["page"]]
-        page_r = page.rect
+    src = fitz.open(stream=pdf_bytes, filetype="pdf")
+    npages = src.page_count
+    chunks = []
+    try:
+        for start in range(0, npages, chunk_pages):
+            end = min(start + chunk_pages, npages)
+            sub = fitz.open()
+            sub.insert_pdf(src, from_page=start, to_page=end - 1)
+            for pno in range(start, end):
+                blocks = pages_blocks[pno] if pno < len(pages_blocks) else None
+                if blocks:
+                    _render_page_block(sub, blocks, translations, uni_bg,
+                                       inpaint_over_images, page_offset=start)
+            # garbage=4 НА ЧАНКУ: дедуп шрифтових сабсетів (insert_htmlbox вшиває
+            # сабсет на КОЖЕН блок -> без дедупу чанк роздувається і пік не падає)
+            chunks.append(sub.tobytes(garbage=4, deflate=True))
+            sub.close()                                 # звільняє накопичену пам'ять чанку
+    finally:
+        src.close()
 
-        # --- беремо лише блоки з НЕПОРОЖНІМ перекладом ---
-        # (непереведені абзаци не чіпаємо: лишаємо чистий оригінал,
-        #  без плашки і без подвійного тексту)
-        live = [b for b in blocks
-                if (translations.get(b["id"]) or "").strip()
-                and not b.get("garbled")
-                and not _looks_garbled(translations.get(b["id"]) or "")]
-        if not live:
-            continue
-
-        # --- ОДИН рівний розмір основного тексту на сторінку ---
-        # (мода розмірів блоків -> прибирає "стрибаючий шрифт")
-        sizes = [max(1, round(b["size"])) for b in live]
-        try:
-            body = statistics.mode(sizes)
-        except statistics.StatisticsError:
-            body = round(statistics.median(sizes))
-        body = max(6, min(int(body), 16))
-
-        # --- блоки ПОВЕРХ зображення -> інпейнтинг замість заливки ---
-        # (на фото/ілюстрації прямокутник фону = видима заплатка; правило 4 не
-        #  зачіпається — биті блоки сюди не доходять, відсіялись у live)
-        def _bbarea(bb):
-            return max(0.0, bb[2] - bb[0]) * max(0.0, bb[3] - bb[1])
-        img_boxes = []
-        if inpaint_over_images:
-            try:
-                pa = page_r.width * page_r.height
-                img_boxes = [im["bbox"] for im in page.get_image_info()
-                             if _bbarea(im["bbox"]) > 0.05 * pa]
-            except Exception:
-                img_boxes = []
-
-        def _over_image(bb):
-            for ib in img_boxes:
-                ox = min(bb[2], ib[2]) - max(bb[0], ib[0])
-                oy = min(bb[3], ib[3]) - max(bb[1], ib[1])
-                if ox > 0 and oy > 0 and ox * oy > 0.6 * max(_bbarea(bb), 1.0):
-                    return True
-            return False
-        over = {b["id"]: _over_image(b["bbox"]) for b in live} if img_boxes else {}
-
-        # --- рендеримо сторінку (раз) для підбору кольору фону ТА інпейнту ---
-        # ЗАВЖДИ (не лише за наявності картинок): так кремові/пергаментні
-        # сторінки заливаються своїм тоном, а не білим.
-        pimg, zoom = None, 2.0
-        if uni_bg is None or any(over.values()):
-            try:
-                from PIL import Image
-                pm = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-                pimg = Image.open(io.BytesIO(pm.tobytes("png"))).convert("RGB")
-            except Exception:
-                pimg = None
-
-        # інпейнт-чистка регіонів блоків поверх зображення (одна маска/inpaint)
-        cleaned_pimg = None
-        if pimg is not None and any(over.values()):
-            regions = []
-            for b in live:
-                if over.get(b["id"]):
-                    x0, y0, x1, y1 = b["bbox"]
-                    cc = b["color"]
-                    col = (int(cc[0] * 255), int(cc[1] * 255), int(cc[2] * 255))
-                    regions.append((x0 * zoom, y0 * zoom, x1 * zoom, y1 * zoom, col))
-            cleaned_pimg, _did = _inpaint_letters(pimg, regions)
-            if not _did:
-                cleaned_pimg = None       # нічого не стерто -> звичайна заливка
-
-        # 3a. РЕДАКЦІЯ: фізично видаляємо оригінал ЛИШЕ під перекладеними блоками.
-        #     Блоки поверх зображення -> без заливки (fill=False): потім кладемо
-        #     інпейнт-патч. Решта -> заливка справжнім тоном фону.
-        for b in live:
-            r = fitz.Rect(b["bbox"])
-            r.x0 -= 1.5; r.y0 -= 1.5; r.x1 += 1.5; r.y1 += 1.5
-            r = r & page_r                      # обов'язково в межах сторінки!
-            if r.is_empty:
-                continue
-            if cleaned_pimg is not None and over.get(b["id"]):
-                page.add_redact_annot(r, fill=False)
-                continue
-            if uni_bg is not None:               # зір: один колір на всю книгу
-                fill = uni_bg
-            elif pimg is not None:               # підбір під фон сторінки
-                x0, y0, x1, y1 = b["bbox"]
-                c = _sample_bg(pimg, x0 * zoom, y0 * zoom, x1 * zoom, y1 * zoom)
-                fill = (c[0] / 255, c[1] / 255, c[2] / 255)
-            else:
-                fill = (1, 1, 1)
-            page.add_redact_annot(r, fill=fill)
-        # текст видаляємо (default), зображення НЕ чіпаємо
-        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-
-        # інпейнт-патчі поверх зображення (натуральний фон замість прямокутника)
-        if cleaned_pimg is not None:
-            for b in live:
-                if not over.get(b["id"]):
-                    continue
-                x0, y0, x1, y1 = b["bbox"]
-                px = (max(0, int(x0 * zoom)), max(0, int(y0 * zoom)),
-                      min(cleaned_pimg.width, int(x1 * zoom)),
-                      min(cleaned_pimg.height, int(y1 * zoom)))
-                if px[2] <= px[0] or px[3] <= px[1]:
-                    continue
-                buf = io.BytesIO()
-                cleaned_pimg.crop(px).save(buf, "PNG")
-                ir = fitz.Rect(x0, y0, x1, y1) & page_r
-                if not ir.is_empty:
-                    page.insert_image(ir, stream=buf.getvalue())
-
-        # верх найближчого блоку нижче (по колонці) — щоб переклад не налазив униз
-        def floor_for(bb):
-            bx0, byt, bx1 = bb["bbox"][0], bb["bbox"][1], bb["bbox"][2]
-            f = page_r.y1 - 2
-            for o in live:
-                if o is bb:
-                    continue
-                ox0, oy0, ox1, _ = o["bbox"]
-                if oy0 > byt + 2 and ox1 > bx0 and ox0 < bx1:
-                    f = min(f, oy0 - 2)
-            return f
-
-        # 3b. Вставляємо переклад через insert_htmlbox — ОФІЦІЙНИЙ метод PyMuPDF
-        #     для цієї задачі: сам підбирає шрифт (зокрема для неперекладених
-        #     шматків) і САМ зменшує текст, якщо не влазить. Розмір тримаємо
-        #     рівним (body), заголовок — більший; рамку зажимаємо по ширині й до
-        #     верху наступного блоку (щоб не вилазило за край і не налазило вниз).
-        import html as _html
-        _arch, _face_css = _font_assets()
-        for b in live:
-            tgt = translations.get(b["id"])
-            is_head = (b["size"] >= body * 1.4 and len(tgt.strip()) <= 55)
-            place_sz = min(b["size"], body * 2.2) if is_head else float(body)
-            x0, y0, x1, y1 = b["bbox"]
-            left = max(x0, 2.0)
-            right = min(x1, page_r.x1 - 2.0)
-            if right <= left + 20:
-                right = min(left + 130, page_r.x1 - 2.0)
-            bottom = floor_for(b)
-            if bottom <= y0 + 8:                      # вироджений випадок: наступний
-                bottom = min(y0 + max(y1 - y0, 12),    # блок майже впритул — дамо мінімум
-                             page_r.y1 - 2.0)
-            rect = fitz.Rect(left, y0 - 1, right, bottom)
-            ff = b["fontfile"] or ""
-            serif = "Serif" in ff
-            fam = "'BookSerif',serif" if serif else "'BookSans',sans-serif"
-            weight = "bold" if "Bold" in ff else "normal"
-            style = "italic" if ("Italic" in ff or "Oblique" in ff) else "normal"
-            r, g, bl = b["color"]
-            hexc = "#%02x%02x%02x" % (int(r * 255), int(g * 255), int(bl * 255))
-            css = (_face_css +
-                   "*{margin:0;padding:0;line-height:1.15;font-family:%s;color:%s;}"
-                   % (fam, hexc))
-            htmltxt = ('<div style="font-size:%.1fpx;font-weight:%s;font-style:%s">%s</div>'
-                       % (place_sz, weight, style, _html.escape(tgt)))
-            try:
-                if _arch is not None:
-                    page.insert_htmlbox(rect, htmltxt, css=css, archive=_arch)
-                else:
-                    page.insert_htmlbox(rect, htmltxt, css=css)
-            except Exception:
-                _place_text(page, b["bbox"], tgt, b["fontname"], b["fontfile"],
-                            b["color"], place_sz, col_right=b["bbox"][2],
-                            max_bottom=bottom)
-
-    out = io.BytesIO()
-    doc.save(out, garbage=4, deflate=True)      # стиснення + дедуп шрифтів
-    doc.close()
-    return out.getvalue()
+    if len(chunks) == 1:                                # одна частина -> фінал прямо на ній
+        cd = fitz.open(stream=chunks[0], filetype="pdf")
+        res = cd.tobytes(garbage=4, deflate=True)
+        cd.close()
+        return res
+    out_doc = fitz.open()
+    for cb in chunks:
+        cd = fitz.open(stream=cb, filetype="pdf")
+        out_doc.insert_pdf(cd)                          # склейка по порядку, без втрат/дублів
+        cd.close()
+    res = out_doc.tobytes(garbage=4, deflate=True)      # дедуп шрифтів на фіналі
+    out_doc.close()
+    return res
 
 
 # ---------------------------------------------------------------- orchestrate
