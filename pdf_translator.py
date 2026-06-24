@@ -1129,7 +1129,12 @@ def _page_images_b64(pdf_bytes, n=5, width=560):
 
 
 def _vision_call(provider, api_key, model, prompt, images_b64, timeout=120,
-                 mime="image/jpeg", gen_config=None):
+                 mime="image/jpeg", gen_config=None, max_retries=5):
+    """Vision-виклик (читання обкладинки/сторінок). Той самий механізм
+    стійкості, що в _gemini_call (правило 7): 429/5xx (включно з 503
+    UNAVAILABLE «high demand») — експоненційні паузи 3→6→12→24→30с і повтор;
+    4xx (крім 429) — _ClientError одразу; мережеві збої — повтор. Без ретраїв
+    один 503 валив усю обкладинку — тепер дотискаємо, як текстовий шлях."""
     if provider == "gemini":
         # thinkingBudget:0 обов'язковий для gemini-2.5-flash (правило 9):
         # без нього модель «думає» і обрізає відповідь.
@@ -1138,29 +1143,47 @@ def _vision_call(provider, api_key, model, prompt, images_b64, timeout=120,
         parts = [{"text": prompt}] + [{"inline_data": {"mime_type": mime, "data": b}}
                                       for b in images_b64]
         # ключ ТІЛЬКИ в заголовку (не в URL) — див. коментар у _gemini_call
-        r = requests.post(
-            f"{_GEMINI_BASE}/{model}:generateContent",
-            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-            json={"contents": [{"role": "user", "parts": parts}],
-                  "generationConfig": cfg},
-            timeout=timeout)
-        if r.status_code >= 400:
-            raise _ClientError(f"Gemini vision {r.status_code}: {r.text[:300]}")
-        cands = r.json().get("candidates", [])
-        return "".join(p.get("text", "") for p in cands[0]["content"]["parts"]) if cands else ""
-    # groq / openai-сумісний
-    content = [{"type": "text", "text": prompt}] + [
-        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b}"}}
-        for b in images_b64]
-    r = requests.post(
-        _GROQ_URL,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={"model": model, "temperature": 0.1,
-              "messages": [{"role": "user", "content": content}]},
-        timeout=timeout)
-    if r.status_code >= 400:
-        raise _ClientError(f"Groq vision {r.status_code}: {r.text[:300]}")
-    return r.json()["choices"][0]["message"]["content"]
+        url = f"{_GEMINI_BASE}/{model}:generateContent"
+        headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+        payload = {"contents": [{"role": "user", "parts": parts}],
+                   "generationConfig": cfg}
+        tag = "Gemini vision"
+    else:
+        # groq / openai-сумісний
+        content = [{"type": "text", "text": prompt}] + [
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b}"}}
+            for b in images_b64]
+        url = _GROQ_URL
+        headers = {"Authorization": f"Bearer {api_key}",
+                   "Content-Type": "application/json"}
+        payload = {"model": model, "temperature": 0.1,
+                   "messages": [{"role": "user", "content": content}]}
+        tag = "Groq vision"
+
+    delay = 3.0
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if r.status_code == 429 or r.status_code >= 500:
+                ra = r.headers.get("retry-after")
+                wait = float(ra) if ra else delay
+                print(f"{tag} {r.status_code}, чекаю {wait:.0f}с (спроба {attempt+1})")
+                time.sleep(min(wait, 30))
+                delay = min(delay * 2, 30)
+                continue
+            if r.status_code >= 400:
+                raise _ClientError(f"{tag} {r.status_code}: {r.text[:300]}")
+            if provider == "gemini":
+                cands = r.json().get("candidates", [])
+                return ("".join(p.get("text", "") for p in cands[0]["content"]["parts"])
+                        if cands else "")
+            return r.json()["choices"][0]["message"]["content"]
+        except requests.RequestException as e:
+            last_err = e
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+    raise RuntimeError(f"{tag} не відповів (мережа/перевантаження): {last_err}")
 
 
 def _default_vision_model(provider):

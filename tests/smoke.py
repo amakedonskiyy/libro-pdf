@@ -495,6 +495,52 @@ def check_worker_pool():
         M._run_local_job = orig
 
 
+def check_vision_retry():
+    """_vision_call: 5xx/429 -> экспоненциальный ретрай и ДОЖИМАЕТ (как
+    _gemini_call, правило 7); 4xx -> _ClientError сразу. Без сети (мок)."""
+    class FakeResp:
+        def __init__(self, code, body="bad"):
+            self.status_code = code
+            self.text = body
+            self.headers = {}
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": "ok-vision"}]}}]}
+
+    seq = [503, 503, 200]                       # два 503, потом успех
+    calls = {"n": 0}
+    def fake_post(url, **kw):
+        i = calls["n"]
+        calls["n"] += 1
+        return FakeResp(seq[i] if i < len(seq) else 200)
+
+    orig_post, orig_sleep = P.requests.post, P.time.sleep
+    P.requests.post = fake_post
+    P.time.sleep = lambda *_a: None             # не ждать паузы в тесте
+    try:
+        out = P._vision_call("gemini", "k", "gemini-2.5-flash", "p", ["b64"])
+        if out != "ok-vision":
+            fail(f"vision retry: не дожал 503->200, вернул {out!r}")
+        if calls["n"] != 3:
+            fail(f"vision retry: ожидалось 3 запроса (503,503,200), было {calls['n']}")
+        # 4xx -> мгновенный _ClientError, без ретраев
+        calls["n"] = 0
+        def fake_400(url, **kw):
+            calls["n"] += 1
+            return FakeResp(400, "bad key")
+        P.requests.post = fake_400
+        raised = False
+        try:
+            P._vision_call("gemini", "k", "m", "p", ["b"])
+        except P._ClientError:
+            raised = True
+        if not raised:
+            fail("vision retry: 4xx не дал мгновенный _ClientError")
+        if calls["n"] != 1:
+            fail(f"vision retry: 4xx ретраился ({calls['n']} запросов вместо 1)")
+    finally:
+        P.requests.post, P.time.sleep = orig_post, orig_sleep
+
+
 def main():
     check_garbled_calibration()
     check_cover_truth_correction()
@@ -504,6 +550,7 @@ def main():
     check_inpaint_letters()
     check_job_guards()
     check_worker_pool()
+    check_vision_retry()
     make_sample()
     with open(SAMPLE, "rb") as f:
         pdf_bytes = f.read()
