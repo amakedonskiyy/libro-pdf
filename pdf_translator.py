@@ -1900,6 +1900,13 @@ _TOC_TITLES = ("содержание", "оглавление", "contents", "зм
 _H1_KW = re.compile(r"^(?:частина|часть|розділ|раздел|глава|part|chapter)\b",
                     re.I)
 
+# вихідні дані (копірайт-сторінка) — НЕ заголовок: бібліокоди УДК/ББК/ISBN/ISSN
+# у будь-якому місці рядка АБО видавничий шифр на початку («Б 79», «К 48»).
+# Битий «!ДК 82-94 ББК… Б 79» додатково ловиться _looks_garbled.
+_IMPRINT = re.compile(
+    r"\b(?:УДК|ББК|ISBN|ISSN|EAN)\b"
+    r"|^\W*[А-ЯA-ZЁ]\s\d{2,4}\b", re.I)
+
 
 def _is_old_toc_page(plines):
     """Сторінка старого змісту: верхній рядок — «Содержание/Оглавление/Зміст»
@@ -2063,6 +2070,12 @@ def _reflow_paragraphs(lines, body_size, set_left, set_right):
 
     def level(sz, text=""):
         t = text.strip()
+        # НЕ заголовок (звичайний потік або викид), навіть якщо кегль великий:
+        # битий рядок, вихідні дані (УДК/ББК/ISBN/«Б 79»), або задовгий рядок.
+        # _looks_garbled лише викликаємо — саму функцію не чіпаємо (правило 3).
+        # Биті лишаться garbled і відсіються подвійним захистом у build_pdf_reflow.
+        if len(t) > 80 or _looks_garbled(t) or _IMPRINT.search(t):
+            return "para"
         kw_h1 = (_H1_KW.match(t) and len(t) < 50
                  and not re.search(r"[.!?]$", t))   # коротка назва, не речення
         if kw_h1 or sz >= body_size * 1.9:

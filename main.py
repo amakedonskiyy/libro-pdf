@@ -72,7 +72,7 @@ def supa_upload_result(path, pdf_bytes):
     return SUPA_URL + "/storage/v1" + r.json()["signedURL"]
 
 
-ENGINE_VERSION = "2026-06-13-reflow-v2"
+ENGINE_VERSION = "2026-06-13-reflow-v3"
 
 
 def _safe_err(e, limit=200):

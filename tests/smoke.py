@@ -335,10 +335,37 @@ def check_reflow_garble_guard():
         fail("reflow guard: блок с битым переводом не отброшен")
 
 
+def check_reflow_heading_guard():
+    """Reflow без сети: детект заголовка НЕ принимает за H1/H2/H3 строку,
+    которая бита (garbled), матчит выходные данные (УДК/ББК/ISBN/«Б 79») или
+    длиннее ~80 символов — даже при крупном кегле. Легитимный заголовок
+    крупным кеглем остаётся заголовком. _looks_garbled/правило 3 не трогаем."""
+    L, R, body = 52.0, 356.0, 11.5
+
+    def kind1(text, size=24):                  # крупный кегль (2.1× моды -> H1)
+        els = P._reflow_paragraphs([_ln(text, L, R, 60, size=size)], body, L, R)
+        return els[0]["kind"] if els else None
+
+    for s in ["УДК 82-94", "ББК 84(2Рос-Рус)6-4", "ISBN 978-5-6051407-5-7",
+              "Б 79", "К 48", "!ДК 82-94 ББК 84(2Рос-Рус)6-4 Б 79"]:
+        if kind1(s) != "para":
+            fail(f"reflow heading-guard: '{s}' -> {kind1(s)} (ожидался para)")
+    long = ("Це дуже довгий рядок основного тексту що випадково набраний "
+            "крупним кеглем але має лишитися звичайним абзацом а не заголовком")
+    if kind1(long) != "para":
+        fail("reflow heading-guard: длинная строка (>80) стала заголовком")
+    # легитимный короткий заголовок крупным кеглем НЕ подавляется
+    if kind1("Вступ") != "h1":
+        fail("reflow heading-guard: легитимный H1 'Вступ' ошибочно подавлен")
+    if kind1("Глава перша") != "h1":
+        fail("reflow heading-guard: легитимный H1 'Глава перша' подавлен")
+
+
 def main():
     check_garbled_calibration()
     check_cover_truth_correction()
     check_reflow_paragraphs()
+    check_reflow_heading_guard()
     check_reflow_garble_guard()
     make_sample()
     with open(SAMPLE, "rb") as f:
