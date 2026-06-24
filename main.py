@@ -76,7 +76,7 @@ def supa_upload_result(path, pdf_bytes):
     return SUPA_URL + "/storage/v1" + r.json()["signedURL"]
 
 
-ENGINE_VERSION = "2026-06-24-vision-retry-v1"
+ENGINE_VERSION = "2026-06-24-quality-flag-v1"
 
 # --- захист від зависань: потолок часу + детект «немає прогресу» ---
 # (переоприділяється env-змінними; у тестах ставимо малі значення)
@@ -90,6 +90,23 @@ _ACTIVE = ("queued", "processing")        # статуси «задача жив
 # =2 -> дві книги одночасно (кожна на своєму ключі — ключ передається у
 # задачу, стан не ділиться). Більше за ліміт -> чекають у черзі.
 MAX_PARALLEL_JOBS = max(1, int(os.environ.get("MAX_PARALLEL_JOBS", 2)))
+
+# --- Уровень 2: порог доли «подозрительных на кашу» строк для флага качества ---
+QUALITY_GARBLE_PCT = float(os.environ.get("QUALITY_GARBLE_PCT", 5.0))
+
+
+def _attach_quality(job_id, out):
+    """УРОВЕНЬ 2: поверх готового PDF считаем кашу и кладём честный флаг.
+    Перевод НЕ блокируется и НЕ падает — книга отдаётся как есть. Любая
+    ошибка сканера -> просто без флага."""
+    try:
+        q = P.quality_scan(out, threshold_pct=QUALITY_GARBLE_PCT)
+        JOBS[job_id]["quality_warning"] = q
+        if q["has_issues"]:
+            print(f"[job {job_id}] quality_warning: {q['garbled_percent']}% "
+                  f"підозрілих рядків, сторінки {q['suspect_pages']}", flush=True)
+    except Exception as e:
+        print(f"[job {job_id}] quality_scan skipped: {e}", flush=True)
 
 
 def _safe_err(e, limit=200):
@@ -356,6 +373,7 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
             out = P.build_pdf_reflow(pdf_bytes, flow, meta, cover_png=cover_png)
             JOBS[job_id]["src_texts"] = {flow[i]["text"]: flow[i].get("uk", "")
                                          for i in good}
+            _attach_quality(job_id, out)      # Уровень 2: флаг качества (не блокирует)
             abort_cb()
             log(f"done: {len(out)//1024}KB")
             path = os.path.join(JOB_DIR, f"{job_id}.pdf")
@@ -469,6 +487,7 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
                     if cover_vision and provider == "gemini":
                         JOBS[job_id]["cover_status"] = "failed"
                     log("cover: could not replace cleanly -> kept original")
+        _attach_quality(job_id, out)          # Уровень 2: флаг качества (не блокирует)
         abort_cb()                            # не зберігати скасовану/таймаут
         log(f"done: {len(out)//1024}KB")
         path = os.path.join(JOB_DIR, f"{job_id}.pdf")
@@ -605,6 +624,7 @@ def list_jobs():
     jobs = [{"job_id": jid, "status": j.get("status"),
              "progress": j.get("progress", 0), "name": j.get("name"),
              "cover_status": j.get("cover_status"),
+             "quality_issues": bool((j.get("quality_warning") or {}).get("has_issues")),
              "error": j.get("error")}
             for jid, j in JOBS.items()]
     active = sum(1 for j in JOBS.values() if j.get("status") in _ACTIVE)

@@ -541,6 +541,43 @@ def check_vision_retry():
         P.requests.post, P.time.sleep = orig_post, orig_sleep
 
 
+def check_quality_scan():
+    """Уровень 2 (без сети): quality_scan флагает кашу в готовом PDF и НЕ
+    флагает здоровый текст/URL/телефоны. _looks_garbled/правило 3 не трогаем."""
+    # детектор: каша True, здоровое False (включая URL/DOI/телефон/ББК)
+    for g in ["M8/ 15-г/ п79;с8/:)J98", "(ба1М1еаг1ес1пезз)", "ПОВЕДЕНЧЕС,И8 ДИСП46"]:
+        if not P._suspect_garble(g):
+            fail(f"quality: каша {g!r} не распознана")
+    for h in ["Звичайний рядок тексту книги.", "doi.org/10.1016/j.x.2022.101",
+              "Тел.: 8 (495) 703-73-93", "ББК 88.5  УДК 159.9"]:
+        if P._suspect_garble(h):
+            fail(f"quality: здоровое {h!r} ложно помечено кашей")
+    serif = P._FONTS[("serif", False, False)]
+    # PDF с кашей -> has_issues:true, suspect_pages непустой
+    bad = fitz.open()
+    for _ in range(2):
+        pg = bad.new_page(width=420, height=595); y = 60
+        for ln in ["M8/ 15-г/ п79;с8/:)J98", "В=а)2о .ей/т1)е э2о?)й",
+                   "ПОВЕДЕНЧЕС,И8 ДИСП46", "(ба1М1еаг1ес1пезз) тут"]:
+            pg.insert_textbox(fitz.Rect(40, y, 380, y+30), ln, fontsize=11,
+                              fontname="s", fontfile=serif); y += 40
+    bb = io.BytesIO(); bad.save(bb); bad.close()
+    qb = P.quality_scan(bb.getvalue(), threshold_pct=5.0)
+    if not qb["has_issues"] or not qb["suspect_pages"]:
+        fail(f"quality: каша-PDF не помечен флагом: {qb}")
+    # чистый PDF -> has_issues:false
+    good = fitz.open()
+    pg = good.new_page(width=420, height=595); y = 60
+    for _ in range(8):
+        pg.insert_textbox(fitz.Rect(40, y, 380, y+30),
+                          "Звичайний чистий рядок книги українською мовою.",
+                          fontsize=11, fontname="s", fontfile=serif); y += 40
+    gb = io.BytesIO(); good.save(gb); good.close()
+    qg = P.quality_scan(gb.getvalue(), threshold_pct=5.0)
+    if qg["has_issues"]:
+        fail(f"quality: чистый PDF ложно помечен: {qg}")
+
+
 def main():
     check_garbled_calibration()
     check_cover_truth_correction()
@@ -551,6 +588,7 @@ def main():
     check_job_guards()
     check_worker_pool()
     check_vision_retry()
+    check_quality_scan()
     make_sample()
     with open(SAMPLE, "rb") as f:
         pdf_bytes = f.read()

@@ -2624,3 +2624,67 @@ def build_pdf_reflow(pdf_bytes, flow, meta, cover_png=None,
     body.close()
     src.close()
     return res
+
+
+# ================================================================
+#   УРОВЕНЬ 2: финальная проверка качества (флаг, НЕ выброс текста)
+# ================================================================
+# Поверх ГОТОВОГО PDF считаем долю подозрительных строк и помечаем страницы.
+# НЕ трогает _looks_garbled / правило 3, НЕ выбрасывает текст, НЕ меняет
+# перевод. Только статистика + честный флаг для фронта.
+
+def _suspect_garble(t):
+    """Статистический детект каши (ТОЛЬКО для подсчёта Уровня 2): radd-профиль
+    через _looks_garbled (НЕ ужесточаем) ИЛИ «слэш»-профиль (M8/ 15-г/
+    п79;с8/:)J98), который _looks_garbled пропускает. «Слэш»-профиль = >=2
+    токена с буквой+цифрой+спецсимволом /;:=)( в одном токене — это ловит
+    кашу, но НЕ одиночный URL/DOI/телефон/библио-ссылку (там такой токен 1)."""
+    if _looks_garbled(t):
+        return True
+    junk = 0
+    for tok in t.split():
+        core = tok.strip("().,;:«»\"'·—-")
+        if (len(core) >= 3
+                and re.search(r"[A-Za-zА-Яа-яЁёЇіІїЄєҐґ]", core)
+                and re.search(r"\d", core)
+                and re.search(r"[/;:=)(]", core)):
+            junk += 1
+    return junk >= 2
+
+
+def quality_scan(pdf_bytes, threshold_pct=5.0):
+    """УРОВЕНЬ 2. Проходит по финальному тексту готового PDF и считает долю
+    подозрительных (на кашу) строк. НИЧЕГО не выбрасывает и не падает —
+    только возвращает флаг для предупреждения на фронте:
+      {"has_issues": bool, "garbled_percent": float, "suspect_pages": [int,...]}
+    suspect_pages — НОМЕРА страниц (1-based) с заметной кашей; заполняется
+    только если общая доля >= threshold_pct. Любая ошибка -> чистый результат
+    (книга всё равно отдаётся как есть)."""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as e:
+        print("quality_scan: open failed:", e)
+        return {"has_issues": False, "garbled_percent": 0.0, "suspect_pages": []}
+    total = 0
+    suspect = 0
+    per_page = {}
+    try:
+        for pno, page in enumerate(doc):
+            for ln in page.get_text("text").split("\n"):
+                ln = ln.strip()
+                if len(ln) < 4:
+                    continue
+                total += 1
+                if _suspect_garble(ln):
+                    suspect += 1
+                    per_page[pno] = per_page.get(pno, 0) + 1
+    except Exception as e:
+        print("quality_scan: scan failed:", e)
+    finally:
+        doc.close()
+    pct = round(100.0 * suspect / max(total, 1), 1)
+    has = pct >= threshold_pct
+    # страница «подозрительна», якщо на ній >=3 битих рядки (одиничний шум
+    # на здоровій сторінці не позначаємо)
+    pages = sorted(p + 1 for p, c in per_page.items() if c >= 3) if has else []
+    return {"has_issues": has, "garbled_percent": pct, "suspect_pages": pages}
