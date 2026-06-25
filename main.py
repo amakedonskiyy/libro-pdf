@@ -77,7 +77,7 @@ def supa_upload_result(path, pdf_bytes):
     return SUPA_URL + "/storage/v1" + r.json()["signedURL"]
 
 
-ENGINE_VERSION = "2026-06-24-chunk-build-v1"
+ENGINE_VERSION = "2026-06-25-server-key-v1"
 
 # --- захист від зависань: потолок часу + детект «немає прогресу» ---
 # (переоприділяється env-змінними; у тестах ставимо малі значення)
@@ -212,6 +212,27 @@ def _safe_err(e, limit=200):
     return re.sub(r"key=[A-Za-z0-9_\-\.]+", "key=***", str(e))[:limit]
 
 
+# --- ключ Gemini: з СЕРВЕРА (env), користувач нічого не вводить ---
+# Слот паралелі визначає воркер: воркер 0 -> GEMINI_API_KEY, воркер 1 ->
+# GEMINI_API_KEY_2 (якщо заданий). Явний api_key із запиту має пріоритет
+# (обратна сумісність зі старим фронтом), але працює і БЕЗ нього.
+_worker_slot = threading.local()
+
+
+def _resolve_key(api_key, provider="gemini"):
+    """Повертає робочий ключ: явний api_key із запиту (якщо непорожній) ->
+    інакше серверний env-ключ. Для gemini слот воркера обирає GEMINI_API_KEY
+    або GEMINI_API_KEY_2. Правило 10: ключ нікуди не логуємо/не віддаємо."""
+    if api_key and api_key.strip():
+        return api_key.strip()                 # явний із запиту (обратна сумісність)
+    if provider == "groq":
+        return os.environ.get("GROQ_API_KEY", "")
+    slot = getattr(_worker_slot, "slot", 0)
+    if slot >= 1 and os.environ.get("GEMINI_API_KEY_2"):
+        return os.environ["GEMINI_API_KEY_2"]  # правий слот паралелі
+    return os.environ.get("GEMINI_API_KEY", "")
+
+
 def _ping_provider(api_key, provider, model):
     """Короткий пінг ключа перед важкою роботою: 4xx (поганий ключ/модель/
     доступ) -> повертає текст помилки -> задача падає одразу (правило 7), а не
@@ -269,10 +290,12 @@ _WORKERS_STARTED = False
 _WORKERS_LOCK = threading.Lock()
 
 
-def _worker_loop():
-    """Воркер: бере задачу з черги і виконує _run_local_job. Падіння однієї
-    задачі НЕ валить воркер (ловимо) і не чіпає інші — кожна ізольована
-    (свій JOBS[id], свій watchdog, своя відміна)."""
+def _worker_loop(slot=0):
+    """Воркер: бере задачу з черги і виконує _run_local_job. slot — індекс
+    слота паралелі (0/1) для вибору серверного ключа (GEMINI_API_KEY /
+    GEMINI_API_KEY_2). Падіння однієї задачі НЕ валить воркер (ловимо) і не
+    чіпає інші — кожна ізольована (свій JOBS[id], свій watchdog, своя відміна)."""
+    _worker_slot.slot = slot
     while True:
         args = _JOB_QUEUE.get()
         try:
@@ -292,8 +315,8 @@ def _ensure_workers():
     with _WORKERS_LOCK:
         if _WORKERS_STARTED:
             return
-        for _ in range(MAX_PARALLEL_JOBS):
-            threading.Thread(target=_worker_loop, daemon=True).start()
+        for i in range(MAX_PARALLEL_JOBS):
+            threading.Thread(target=_worker_loop, args=(i,), daemon=True).start()
         _WORKERS_STARTED = True
         print(f"job pool: {MAX_PARALLEL_JOBS} worker(s) started", flush=True)
 
@@ -313,12 +336,15 @@ def health():
 
 
 @app.post("/translate-pdf-sync")
-def translate_sync(file: UploadFile = File(...), api_key: str = Form(...),
+def translate_sync(file: UploadFile = File(...), api_key: str = Form(""),
                    provider: str = Form("gemini"), model: str = Form(""),
                    src: str = Form("ru"), dst: str = Form("uk"),
                    proofread: bool = Form(False)):
     """Синхронно: PDF -> готовий PDF. ТІЛЬКИ дрібні файли (~5 стор.)."""
     pdf_bytes = file.file.read()
+    api_key = _resolve_key(api_key, provider)        # явний -> інакше серверний env
+    if not api_key:
+        raise HTTPException(400, "Gemini-ключ не налаштований (env GEMINI_API_KEY)")
     try:
         out = P.translate_pdf(pdf_bytes, api_key, provider=provider,
                               model=model or None, src=src, dst=dst,
@@ -396,12 +422,20 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
         now = time.time()
         JOBS[job_id].update(status="processing", progress=1,
                             started=now, last_progress=now)
-        if AUTO_RESUME_MAX > 0:               # ключ у пам'яті лише для авто-resume
-            JOBS[job_id]["_api_key"] = api_key  # (відфільтрований з усіх відповідей API)
+        if AUTO_RESUME_MAX > 0:               # зберігаємо ВИХІДНИЙ api_key (часто
+            JOBS[job_id]["_api_key"] = api_key  # порожній у env-режимі) для авто-resume
         _start_watchdog(job_id)
         log(f"start [{ENGINE_VERSION}]: {len(pdf_bytes)//1024}KB, provider={provider}, model={model!r}, src={src}, vision={vision}, cover_vision={cover_vision}, layout={layout_mode}")
 
         abort_cb()                            # відмінили ще в черзі -> не палимо ключ
+        # ключ: явний із запиту -> інакше серверний env (слот воркера). Резолвимо
+        # ТУТ (у воркері), щоб слот паралелі обрав GEMINI_API_KEY / _2.
+        api_key = _resolve_key(api_key, provider)
+        if not api_key:
+            log("no key: ні api_key у запиті, ні GEMINI_API_KEY на сервері")
+            JOBS[job_id].update(status="error",
+                error="Gemini-ключ не налаштований на сервері (env GEMINI_API_KEY)")
+            return
         kerr = _ping_provider(api_key, provider, model)
         if kerr:
             log(f"key ping failed: {_safe_err(kerr)}")
@@ -622,7 +656,7 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
 
 
 @app.post("/jobs")
-async def create_job(file: UploadFile = File(...), api_key: str = Form(...),
+async def create_job(file: UploadFile = File(...), api_key: str = Form(""),
                      provider: str = Form("gemini"), model: str = Form(""),
                      src: str = Form("ru"), dst: str = Form("uk"),
                      proofread: bool = Form(False),
@@ -678,7 +712,7 @@ async def create_job(file: UploadFile = File(...), api_key: str = Form(...),
 
 @app.post("/jobs/{job_id}/rebuild")
 async def rebuild_job(job_id: str,
-                      api_key: str = Form(...), model: str = Form(""),
+                      api_key: str = Form(""), model: str = Form(""),
                       cover_mode: str = Form("")):
     """Пересборка ГОТОВОГО перекладу чистим reflow-PDF: новий job у режимі
     reflow з ТОГО Ж вихідника. Якщо переклади вихідного job ще в пам'яті
@@ -742,7 +776,7 @@ def _resume_enqueue(job_id, api_key, model_override=""):
 
 
 @app.post("/jobs/{job_id}/resume")
-def resume_job(job_id: str, api_key: str = Form(...), model: str = Form("")):
+def resume_job(job_id: str, api_key: str = Form(""), model: str = Form("")):
     """Продовжити перерваний (stalled/timeout/error) переклад з ПЕРШОГО
     неперекладеного блоку. Уже перекладене лежить у чекпойнті на диску — API
     на нього вдруге НЕ палиться. Якщо Gemini ще в 503 — знову stalled, прогрес
@@ -821,7 +855,7 @@ def job_download(job_id: str):
 
 
 @app.post("/cover")
-def cover(file: UploadFile = File(...), api_key: str = Form(...),
+def cover(file: UploadFile = File(...), api_key: str = Form(""),
           provider: str = Form("gemini"), model: str = Form(""),
           src: str = Form("ru"), dst: str = Form("uk"),
           title: str = Form(""), author: str = Form(""),
@@ -829,6 +863,9 @@ def cover(file: UploadFile = File(...), api_key: str = Form(...),
     """Генерує обкладинку з перекладеною назвою (PNG). vision=true -> зір вирішує
     'замінити на місці' чи 'генерувати'. title/author можна задати вручну."""
     pdf_bytes = file.file.read()
+    api_key = _resolve_key(api_key, provider)
+    if not api_key:
+        raise HTTPException(400, "Gemini-ключ не налаштований (env GEMINI_API_KEY)")
     try:
         recipe = (P.analyze_book(pdf_bytes, api_key, provider=provider,
                                  model=(vision_model or None), n=3) if vision else {})
@@ -842,7 +879,7 @@ def cover(file: UploadFile = File(...), api_key: str = Form(...),
 
 
 @app.post("/cover/generate")
-def cover_generate(file: UploadFile = File(...), api_key: str = Form(...),
+def cover_generate(file: UploadFile = File(...), api_key: str = Form(""),
                    provider: str = Form("gemini"), model: str = Form(""),
                    src: str = Form("ru"), dst: str = Form("uk")):
     """Обкладинка З НУЛЯ (чиста типографіка на палітрі оригіналу).
@@ -851,6 +888,9 @@ def cover_generate(file: UploadFile = File(...), api_key: str = Form(...),
     if provider != "gemini":
         raise HTTPException(400, "cover/generate працює лише з provider=gemini")
     pdf_bytes = file.file.read()
+    api_key = _resolve_key(api_key, provider)
+    if not api_key:
+        raise HTTPException(400, "Gemini-ключ не налаштований (env GEMINI_API_KEY)")
     try:
         png = P.render_cover_png(pdf_bytes)
         blocks, _reasons = P.read_cover_blocks(png, api_key, glossary=None,
@@ -870,11 +910,14 @@ def cover_generate(file: UploadFile = File(...), api_key: str = Form(...),
 
 
 @app.post("/preview")
-def preview(file: UploadFile = File(...), api_key: str = Form(...),
+def preview(file: UploadFile = File(...), api_key: str = Form(""),
             provider: str = Form("gemini"), model: str = Form(""),
             src: str = Form("ru"), dst: str = Form("uk"),
             proofread: bool = Form(False)):
     pdf_bytes = file.file.read()
+    api_key = _resolve_key(api_key, provider)
+    if not api_key:
+        raise HTTPException(400, "Gemini-ключ не налаштований (env GEMINI_API_KEY)")
     pages = P.extract_blocks(pdf_bytes, ocr_lang=P._LANG_OCR.get(src, "rus"))
     flat = [(b["id"], b["text"]) for blocks in pages for b in blocks]
     tr = P.translate_blocks([t for _, t in flat], api_key, provider=provider,
@@ -890,6 +933,11 @@ def preview(file: UploadFile = File(...), api_key: str = Form(...),
 def _run_job(pdf_bytes, translation_id, api_key, provider, model, src, dst,
              proofread, filename):
     try:
+        api_key = _resolve_key(api_key, provider)    # явний -> інакше серверний env
+        if not api_key:
+            supa_update(translation_id, status="error",
+                        error="Gemini-ключ не налаштований (env GEMINI_API_KEY)")
+            return
         supa_update(translation_id, status="processing", progress=1)
 
         def cb(done, total):
@@ -920,7 +968,7 @@ def _run_job(pdf_bytes, translation_id, api_key, provider, model, src, dst,
 @app.post("/translate-pdf")
 async def translate_async(background: BackgroundTasks,
                           file: UploadFile = File(...), translation_id: str = Form(...),
-                          api_key: str = Form(...),
+                          api_key: str = Form(""),
                           provider: str = Form("gemini"), model: str = Form(""),
                           src: str = Form("ru"), dst: str = Form("uk"),
                           proofread: bool = Form(False)):

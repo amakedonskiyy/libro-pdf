@@ -659,6 +659,42 @@ def check_chunk_build():
     dc.close(); dm.close()
 
 
+def check_server_key():
+    """Серверный ключ из env (без сети): без api_key берётся GEMINI_API_KEY,
+    явный имеет приоритет, слот1 -> GEMINI_API_KEY_2; правило 10 — ключ НЕ
+    светится в /jobs/{id} и в списке /jobs."""
+    import main as M
+    saved = (os.environ.get("GEMINI_API_KEY"), os.environ.get("GEMINI_API_KEY_2"))
+    try:
+        os.environ["GEMINI_API_KEY"] = "ENVKEY1"
+        os.environ.pop("GEMINI_API_KEY_2", None)
+        M._worker_slot.slot = 0
+        if M._resolve_key("USERKEY", "gemini") != "USERKEY":
+            fail("server key: явный api_key должен иметь приоритет")
+        if M._resolve_key("", "gemini") != "ENVKEY1":
+            fail("server key: без api_key не взят env GEMINI_API_KEY")
+        os.environ["GEMINI_API_KEY_2"] = "ENVKEY2"
+        M._worker_slot.slot = 1
+        if M._resolve_key("", "gemini") != "ENVKEY2":
+            fail("server key: слот1 не взял GEMINI_API_KEY_2")
+        M._worker_slot.slot = 0
+        # правило 10: ключ не в ответах API
+        M.JOBS["sk1"] = {"status": "processing", "_api_key": "SECRET", "name": "x"}
+        if "_api_key" in M.job_status("sk1"):
+            fail("server key: _api_key протёк в GET /jobs/{id}")
+        if any(("_api_key" in j or "api_key" in j) for j in M.list_jobs()["jobs"]):
+            fail("server key: ключ протёк в список /jobs")
+        M.JOBS.pop("sk1", None)
+        os.environ.pop("GEMINI_API_KEY", None)
+        os.environ.pop("GEMINI_API_KEY_2", None)
+        if M._resolve_key("", "gemini") != "":
+            fail("server key: без api_key и без env должно быть пусто")
+    finally:
+        M._worker_slot.slot = 0
+        for k, v in zip(("GEMINI_API_KEY", "GEMINI_API_KEY_2"), saved):
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+
 def main():
     check_garbled_calibration()
     check_cover_truth_correction()
@@ -672,6 +708,7 @@ def main():
     check_quality_scan()
     check_resume_checkpoint()
     check_chunk_build()
+    check_server_key()
     make_sample()
     with open(SAMPLE, "rb") as f:
         pdf_bytes = f.read()
