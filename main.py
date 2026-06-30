@@ -24,7 +24,7 @@ import hashlib
 import threading
 import traceback
 import requests
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 
@@ -77,13 +77,20 @@ def supa_upload_result(path, pdf_bytes):
     return SUPA_URL + "/storage/v1" + r.json()["signedURL"]
 
 
-ENGINE_VERSION = "2026-06-25-server-key-v1"
+ENGINE_VERSION = "2026-06-30-adaptive-limits-v1"
 
 # --- захист від зависань: потолок часу + детект «немає прогресу» ---
 # (переоприділяється env-змінними; у тестах ставимо малі значення)
-JOB_TOTAL_LIMIT = int(os.environ.get("LIBRO_JOB_TOTAL_LIMIT", 60 * 60))   # 60 хв
+JOB_TOTAL_LIMIT = int(os.environ.get("LIBRO_JOB_TOTAL_LIMIT", 60 * 60))   # 60 хв (фолбек)
 JOB_STALL_LIMIT = int(os.environ.get("LIBRO_JOB_STALL_LIMIT", 8 * 60))    # 8 хв без прогресу
 JOB_WATCH_INTERVAL = float(os.environ.get("LIBRO_JOB_WATCH_INTERVAL", 5))  # такт watchdog
+# --- адаптивний потолок часу: масштаб від числа сторінок, з підлогою/стелею ---
+# (велику книгу фіксований ліміт рубив на ~98% попри прогрес — звідси масштаб)
+JOB_TIME_PER_100P = int(os.environ.get("LIBRO_JOB_MIN_PER_100P", 20)) * 60   # сек на 100 стор.
+JOB_TIME_FLOOR = int(os.environ.get("LIBRO_JOB_TIME_FLOOR", 1800))           # підлога 30 хв
+JOB_TIME_CAP = int(os.environ.get("LIBRO_JOB_TIME_CAP", 4 * 60 * 60))        # стеля 4 год
+# --- серверний потолок розміру завантаження (захист контейнера) ---
+MAX_UPLOAD_BYTES = int(os.environ.get("LIBRO_MAX_UPLOAD_MB", 500)) * 1024 * 1024
 _ACTIVE = ("queued", "processing")        # статуси «задача жива» (для дублів)
 
 # --- пул воркерів: паралельні переклади з лімітом (захист контейнера) ---
@@ -96,8 +103,22 @@ MAX_PARALLEL_JOBS = max(1, int(os.environ.get("MAX_PARALLEL_JOBS", 2)))
 QUALITY_GARBLE_PCT = float(os.environ.get("QUALITY_GARBLE_PCT", 5.0))
 
 # --- чекпойнт/resume: добивать книгу за несколько подходов несмотря на 503 ---
-AUTO_RESUME_MAX = int(os.environ.get("AUTO_RESUME_MAX", 2))      # 0 = только вручную
+AUTO_RESUME_MAX = int(os.environ.get("AUTO_RESUME_MAX", 5))      # 0 = только вручную
 AUTO_RESUME_DELAY = float(os.environ.get("AUTO_RESUME_DELAY", 90))  # пауза перед авто-resume
+
+
+def _job_time_budget(pdf_bytes):
+    """Адаптивний потолок часу: масштаб від числа сторінок, підлога/стеля.
+    Сторінки не зчитались -> старий фіксований JOB_TOTAL_LIMIT (сумісність)."""
+    try:
+        import fitz
+        d = fitz.open(stream=pdf_bytes, filetype="pdf")
+        n = d.page_count
+        d.close()
+        budget = JOB_TIME_FLOOR + (JOB_TIME_PER_100P * n) // 100
+        return max(JOB_TIME_FLOOR, min(JOB_TIME_CAP, budget))
+    except Exception:
+        return JOB_TOTAL_LIMIT
 
 
 def _ckpt_path(job_id):
@@ -272,8 +293,9 @@ def _start_watchdog(job_id):
             now = time.time()
             total = now - j.get("started", now)
             stall = now - j.get("last_progress", now)
-            if total > JOB_TOTAL_LIMIT or stall > JOB_STALL_LIMIT:
-                why = ("перевищено час задачі" if total > JOB_TOTAL_LIMIT
+            lim = j.get("total_limit", JOB_TOTAL_LIMIT)
+            if total > lim or stall > JOB_STALL_LIMIT:
+                why = ("перевищено час задачі" if total > lim
                        else "переклад не рухається")
                 j["abort_reason"] = "timeout"
                 j["cancel"] = True
@@ -422,6 +444,7 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
         now = time.time()
         JOBS[job_id].update(status="processing", progress=1,
                             started=now, last_progress=now)
+        JOBS[job_id]["total_limit"] = _job_time_budget(pdf_bytes)  # адаптивний потолок часу
         if AUTO_RESUME_MAX > 0:               # зберігаємо ВИХІДНИЙ api_key (часто
             JOBS[job_id]["_api_key"] = api_key  # порожній у env-режимі) для авто-resume
         _start_watchdog(job_id)
@@ -656,7 +679,8 @@ def _run_local_job(job_id, pdf_bytes, api_key, provider, model, src, dst,
 
 
 @app.post("/jobs")
-async def create_job(file: UploadFile = File(...), api_key: str = Form(""),
+async def create_job(request: Request,
+                     file: UploadFile = File(...), api_key: str = Form(""),
                      provider: str = Form("gemini"), model: str = Form(""),
                      src: str = Form("ru"), dst: str = Form("uk"),
                      proofread: bool = Form(False),
@@ -671,7 +695,12 @@ async def create_job(file: UploadFile = File(...), api_key: str = Form(""),
     cover_mode (для reflow): generate (дефолт) | replace | original."""
     if layout_mode not in ("preserve", "reflow"):
         raise HTTPException(400, "layout_mode: preserve | reflow")
+    cl = request.headers.get("content-length")   # дешевий чек ДО читання тіла в пам'ять
+    if cl and int(cl) > int(MAX_UPLOAD_BYTES * 1.05):
+        raise HTTPException(413, f"Файл завеликий (ліміт {MAX_UPLOAD_BYTES // (1024*1024)} МБ)")
     pdf_bytes = await file.read()
+    if len(pdf_bytes) > MAX_UPLOAD_BYTES:        # реальний розмір (Content-Length міг збрехати)
+        raise HTTPException(413, f"Файл завеликий (ліміт {MAX_UPLOAD_BYTES // (1024*1024)} МБ)")
     # захист від дублів: той самий файл (хеш вмісту) у тому ж режимі вже
     # обробляється -> не плодимо другу задачу, повертаємо наявну (перезавантаження
     # сторінки / подвійний клік не запускають повторний прогін і не палять API)
