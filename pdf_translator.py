@@ -337,9 +337,14 @@ def _groq_call(api_key, model, system, user, timeout=120, max_retries=5):
     raise RuntimeError(f"Groq не відповів (мережа): {last_err}")
 
 
-def _gemini_call(api_key, model, system, user, timeout=120, max_retries=5):
+def _gemini_call(api_key, model, system, user, thinking_config=None,
+                 max_tokens=8192, timeout=120, max_retries=5):
     """Виклик Gemini (Google AI). 4xx (крім 429) — одразу падаємо з причиною."""
     url = f"{_GEMINI_BASE}/{model}:generateContent"
+    tcfg = thinking_config if thinking_config is not None else {"thinkingBudget": 0}
+    gen = {"maxOutputTokens": max_tokens, "thinkingConfig": tcfg}
+    if "gemini-3" not in model:
+        gen["temperature"] = 0.2       # 3.x: дефолтна температура, інакше залипання
     delay = 3.0
     last_err = None
     for attempt in range(max_retries):
@@ -353,8 +358,7 @@ def _gemini_call(api_key, model, system, user, timeout=120, max_retries=5):
                 json={
                     "systemInstruction": {"parts": [{"text": system}]},
                     "contents": [{"role": "user", "parts": [{"text": user}]}],
-                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192,
-                                         "thinkingConfig": {"thinkingBudget": 0}},
+                    "generationConfig": gen,
                 },
                 timeout=timeout,
             )
@@ -379,14 +383,29 @@ def _gemini_call(api_key, model, system, user, timeout=120, max_retries=5):
     raise RuntimeError(f"Gemini не відповів (мережа): {last_err}")
 
 
-def _llm_call(provider, api_key, model, system, user):
+def _llm_call(provider, api_key, model, system, user, thinking_config=None, max_tokens=8192):
     if provider == "gemini":
-        return _gemini_call(api_key, model, system, user)
+        return _gemini_call(api_key, model, system, user,
+                            thinking_config=thinking_config, max_tokens=max_tokens)
     return _groq_call(api_key, model, system, user)
 
 
 def _default_model(provider):
     return "gemini-2.5-flash" if provider == "gemini" else "llama-3.3-70b-versatile"
+
+
+# --- редактор (proofread): окрема модель + thinking; перекладач лишається flash ---
+EDITOR_MODEL = os.environ.get("LIBRO_EDITOR_MODEL", "gemini-3.1-pro-preview")
+EDITOR_THINKING_LEVEL = os.environ.get("LIBRO_EDITOR_THINKING_LEVEL", "MEDIUM")
+EDITOR_THINKING_BUDGET = int(os.environ.get("LIBRO_EDITOR_THINKING_BUDGET", -1))
+EDITOR_MAX_TOKENS = int(os.environ.get("LIBRO_EDITOR_MAX_TOKENS", 16384))
+
+
+def _editor_thinking_config():
+    """3.x -> {'thinkingLevel': ...}; інакше -> {'thinkingBudget': ...}."""
+    if "gemini-3" in EDITOR_MODEL:
+        return {"thinkingLevel": EDITOR_THINKING_LEVEL}
+    return {"thinkingBudget": EDITOR_THINKING_BUDGET}
 
 
 def _has_letter(s):
@@ -508,6 +527,10 @@ def proofread_blocks(originals, drafts, api_key, provider, model, src, dst,
         system += ("\nДотримуйся глосарію (саме ці переклади термінів): " + gl)
     out = list(drafts)
     n = len(drafts)
+    # редактор: окрема модель і thinking-конфіг (gemini); для groq — як було
+    ed_model = EDITOR_MODEL if provider == "gemini" else model
+    ed_tc = _editor_thinking_config() if provider == "gemini" else None
+    ed_max = EDITOR_MAX_TOKENS if provider == "gemini" else 8192
 
     def pair(i):
         return f"ОРИГІНАЛ:\n{originals[i]}\n\nЧЕРНЕТКА:\n{drafts[i]}"
@@ -523,7 +546,8 @@ def proofread_blocks(originals, drafts, api_key, provider, model, src, dst,
                 + _DELIM.join(pair(i) for i in batch))
         ok = False
         try:
-            resp = _llm_call(provider, api_key, model, system, user)
+            resp = _llm_call(provider, api_key, ed_model, system, user,
+                             thinking_config=ed_tc, max_tokens=ed_max)
             parts = [p.strip() for p in resp.split("<<<§>>>")]
             if len(parts) == len(batch):
                 for k, idx in enumerate(batch):
@@ -535,8 +559,9 @@ def proofread_blocks(originals, drafts, api_key, provider, model, src, dst,
         if not ok:
             for idx in batch:
                 try:
-                    fixed = _llm_call(provider, api_key, model, system,
-                                      pair(idx) + "\n\nПоверни лише виправлений переклад.")
+                    fixed = _llm_call(provider, api_key, ed_model, system,
+                                      pair(idx) + "\n\nПоверни лише виправлений переклад.",
+                                      thinking_config=ed_tc, max_tokens=ed_max)
                     if fixed.strip():
                         out[idx] = fixed.strip()
                 except Exception as e:
