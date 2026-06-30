@@ -1843,6 +1843,11 @@ def read_cover_blocks(cover_png_bytes, api_key, glossary=None,
     return blocks, reasons
 
 
+# Поріг строгості обкладинки: скільки блоків дозволено ПРОПУСТИТИ перш ніж
+# обкладинка вважається ПРОВАЛЕНОЮ. 0 = строго (будь-яка змішана RU/UK -> failed).
+COVER_MAX_SKIPPED = int(os.environ.get("LIBRO_COVER_MAX_SKIPPED", "0"))
+
+
 def translate_cover_vision(cover_png_bytes, api_key, glossary=None,
                            src="ru", dst="uk", model=None, pdf_bytes=None):
     """Зір читає обкладинку -> переклад -> ПРИБИРАННЯ оригінальних літер через
@@ -1910,6 +1915,15 @@ def translate_cover_vision(cover_png_bytes, api_key, glossary=None,
         # жоден блок не вдалося замаскувати -> нічого перекладати на обкладинці.
         # Виняток нагору -> ланцюжок іде в OCR-на-місці / оригінал (правило 6).
         raise ValueError("жоден блок обкладинки не вдалося замаскувати")
+
+    # СТРОГО: будь-який пропущений блок -> змішана RU/UK обкладинка, ГІРША за
+    # чистий оригінал (правило 6). Краще failed (оригінал лишається) + фронт
+    # пропонує згенерувати нову. Поріг env-керований.
+    skipped = len(blocks) - len(boxes)
+    if skipped > COVER_MAX_SKIPPED:
+        raise ValueError(
+            f"обкладинку перекладено частково: {skipped} з {len(blocks)} "
+            f"блоків не вдалося замаскувати — краще згенерувати нову")
 
     # --- 2. сигнал: уточнені рамки не мають перетинатися
     for i in range(len(boxes)):
