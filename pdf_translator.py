@@ -217,6 +217,9 @@ _SYS_PROMPT = (
     "Ти — професійний літературний перекладач книжок.\n"
     "Перекладай з {src} на {dst}.\n"
     "ЖОРСТКІ ПРАВИЛА:\n"
+    "0. ПЕРЕКЛАДАЙ ЛИШЕ наданий текст сегмента. Нічого не вигадуй, не додавай, "
+    "не коментуй, не пояснюй, не описуй себе і не грай роль. Якщо сегмент "
+    "порожній або не містить тексту — поверни порожній рядок.\n"
     "1. Виводь ВИКЛЮЧНО {dst} мовою. Жодного російського слова чи русизму, "
     "навіть якщо оригінал містить кальки. Перевіряй кожне слово.\n"
     "2. Не додавай і не прибирай речень. Зберігай зміст, тон і стиль автора.\n"
@@ -386,10 +389,16 @@ def _default_model(provider):
     return "gemini-2.5-flash" if provider == "gemini" else "llama-3.3-70b-versatile"
 
 
-def _make_batches(items_len, length_of, char_budget):
-    """Групує індекси у батчі за сумарною довжиною."""
+def _has_letter(s):
+    """True, якщо в рядку є хоч одна літера (будь-яка мова)."""
+    return any(ch.isalpha() for ch in s)
+
+
+def _make_batches(items_len, length_of, char_budget, indices=None):
+    """Групує індекси у батчі за сумарною довжиною. indices — явний список
+    індексів (якщо заданий, батчимо лише їх; інакше range(items_len), як було)."""
     batches, cur, cur_len = [], [], 0
-    for i in range(items_len):
+    for i in (indices if indices is not None else range(items_len)):
         L = length_of(i)
         if cur and cur_len + L > char_budget:
             batches.append(cur)
@@ -437,7 +446,17 @@ def translate_blocks(texts, api_key, provider="gemini", model=None,
         if progress_cb:
             progress_cb(work[0], total_work)
 
-    batches = _make_batches(total, lambda i: len(texts[i]), char_budget)
+    # Порожні / без-літерні блоки у LLM НЕ шлемо — інакше модель «дописує» персону.
+    real = [i for i in range(total) if texts[i].strip() and _has_letter(texts[i])]
+    real_set = set(real)
+    for i in range(total):
+        if i not in real_set:
+            out[i] = texts[i]
+    skipped = total - len(real)
+    if skipped:
+        report(skipped * phases)        # пропущені блоки готові одразу (обидві фази)
+
+    batches = _make_batches(total, lambda i: len(texts[i]), char_budget, indices=real)
     for batch in batches:
         if abort_cb:
             abort_cb()                       # cancel/timeout -> _Aborted нагору
@@ -475,12 +494,13 @@ def translate_blocks(texts, api_key, provider="gemini", model=None,
     if proofread:
         out = proofread_blocks(texts, out, api_key, provider, model, src, dst,
                                char_budget=char_budget, on_done=report,
-                               glossary=glossary, abort_cb=abort_cb)
+                               glossary=glossary, abort_cb=abort_cb, indices=real)
     return out
 
 
 def proofread_blocks(originals, drafts, api_key, provider, model, src, dst,
-                     char_budget=2500, on_done=None, glossary=None, abort_cb=None):
+                     char_budget=2500, on_done=None, glossary=None, abort_cb=None,
+                     indices=None):
     """Другий прохід: редактор виправляє чернетку, звіряючи з оригіналом."""
     system = _EDITOR_PROMPT.format(src=_LANG.get(src, src), dst=_LANG.get(dst, dst))
     if glossary:
@@ -492,7 +512,8 @@ def proofread_blocks(originals, drafts, api_key, provider, model, src, dst,
     def pair(i):
         return f"ОРИГІНАЛ:\n{originals[i]}\n\nЧЕРНЕТКА:\n{drafts[i]}"
 
-    batches = _make_batches(n, lambda i: len(originals[i]) + len(drafts[i]), char_budget)
+    batches = _make_batches(n, lambda i: len(originals[i]) + len(drafts[i]),
+                            char_budget, indices=indices)
     for batch in batches:
         if abort_cb:
             abort_cb()
