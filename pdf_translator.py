@@ -1852,7 +1852,8 @@ def translate_cover_vision(cover_png_bytes, api_key, glossary=None,
         ix0, iy0 = max(0, int(x0 - pad)), max(0, int(y0 - pad))
         ix1, iy1 = min(W, int(x1 + pad) + 1), min(H, int(y1 + pad) + 1)
         if ix1 <= ix0 or iy1 <= iy0:
-            raise ValueError(f"порожня рамка тексту: {b['text'][:30]!r}")
+            reasons.append(f"пропущено блок (порожня рамка): {b['text'][:24]!r}")
+            continue
         region = arr[iy0:iy1, ix0:ix1]
         sub = _color_mask(region, b["color"])
         if float(sub.mean()) < 0.005:            # ширший допуск за відстанню
@@ -1863,11 +1864,12 @@ def translate_cover_vision(cover_png_bytes, api_key, glossary=None,
                            f"{b['text'][:24]!r}")
         runs = _mask_lines(sub)
         if float(sub.mean()) < 0.005 or not runs:
-            # і контраст не дав літер: затирати наосліп і малювати кеглем
-            # «на всю рамку» = знищити обкладинку. Виняток нагору ->
-            # ланцюжок піде в OCR-на-місці / оригінал (правило 6).
-            raise ValueError(f"маска літер порожня (ні колір, ні контраст "
-                             f"не дали літер): {b['text'][:30]!r}")
+            # ПРОЩАЮЧИЙ РЕЖИМ: маску цього блоку не зібрати -> ПРОПУСКАЄМО блок
+            # (оригінальні літери лишаються), решту перекладаємо. Раніше тут був
+            # raise, що ронив ВСЮ обкладинку через один блок (правило 6).
+            reasons.append(f"пропущено блок (маску літер не зібрати): "
+                           f"{b['text'][:24]!r}")
+            continue
         mview = mask[iy0:iy1, ix0:ix1]
         mview[sub] = 255
         heights = sorted(bb - aa for aa, bb in runs)
@@ -1878,6 +1880,11 @@ def translate_cover_vision(cover_png_bytes, api_key, glossary=None,
         else:
             pitch_ratio = 1.15
         boxes.append((b, x0, y0, x1, y1, line_h, pitch_ratio))
+
+    if not boxes:
+        # жоден блок не вдалося замаскувати -> нічого перекладати на обкладинці.
+        # Виняток нагору -> ланцюжок іде в OCR-на-місці / оригінал (правило 6).
+        raise ValueError("жоден блок обкладинки не вдалося замаскувати")
 
     # --- 2. сигнал: уточнені рамки не мають перетинатися
     for i in range(len(boxes)):
